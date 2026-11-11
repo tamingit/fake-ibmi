@@ -10,7 +10,7 @@ It was split out of [GreenGlow Connect](https://github.com/tamingit/greenglow), 
 
 **5250 display (Telnet, port 2323)**
 
-- **Negotiation:** TN5250E: terminal type, binary, end of record and NEW-ENVIRON.
+- **Negotiation:** TN5250E, one option at a time as an IBM i does it: NEW-ENVIRON, then the terminal type, then end of record and binary. It asks for a value only once the client has agreed to the option. A client that refuses NEW-ENVIRON still gets a session.
 - **Device names:** it honours the device name a client asks for (`DEVNAME`). Without one, it makes one up. A name already in use gets the Startup Response Record's error code, as on a real system.
 - **Screens:**
   - **Sign-on:** any user name signs on, and the password is ignored. A blank user gets "User required".
@@ -40,8 +40,27 @@ With the .NET 10 SDK:
 dotnet run --project src/FakeIbmI -- --port 2323 --print-port 8474
 ```
 
-- **Options:** `--port` (default 2323), `--print-port` (default: no Network Print server) and `--bind`.
+- **Options:**
+  - `--port`: the 5250 port (default 2323).
+  - `--print-port`: the Network Print port (default: no Network Print server).
+  - `--bind`: the address to listen on (default `127.0.0.1`).
+  - `--trace`: logs each Telnet negotiation step, and each record's length. It never logs a record's contents, or the value of a NEW-ENVIRON variable that can hold a secret (`IBMSUBSPW`, `IBMRSEED`).
 - **Listening address:** by default it listens on loopback only. The image passes `--bind 0.0.0.0` so it can be reached from outside the container. Publish it on `127.0.0.1`, as above, unless you mean other machines to reach it.
+
+## Connecting with IBM i Access Client Solutions
+
+1. Start the fake where the PC running ACS can reach it, with the trace on:
+   ```bash
+   dotnet run --project src/FakeIbmI -- --port 2323 --bind 0.0.0.0 --trace
+   ```
+   Or with Docker (arguments after the image name are added to the image's own): `docker run --rm -p 2323:2323 ghcr.io/tamingit/fake-ibmi:beta --trace`.
+2. In ACS, make a 5250 session with this machine's address as the system, port 2323, and SSL off.
+3. Any user name signs on; the password is ignored.
+
+If it doesn't connect, the trace shows how far the negotiation got:
+
+- **No `connected` line at all:** ACS never reached the fake. Check the address, the port and the firewall.
+- **It stops partway:** the last `<-` and `->` lines show which step the client didn't answer.
 
 ## Tests
 

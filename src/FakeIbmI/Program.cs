@@ -1,12 +1,13 @@
 // Runs the scripted fake IBM i until Ctrl+C:
-//   dotnet run --project src/FakeIbmI -- --port 2323 [--print-port 2324] [--bind 0.0.0.0]
+//   dotnet run --project src/FakeIbmI -- --port 2323 [--print-port 8474] [--bind 0.0.0.0] [--trace]
 // --print-port also runs its Network Print server (printer output), for PRTUSER / Secret12.
-// --bind listens on another address than loopback (the demo container: 0.0.0.0).
+// --bind listens on another address than loopback (0.0.0.0: every interface).
+// --trace logs each Telnet negotiation step, and each record's length (never its contents).
 
 using FakeIbmI;
 
 var options = Options.Parse(args);
-await using var host = await TelnetServer.StartAsync(options.Port, line => Console.WriteLine(line), options.Bind);
+await using var host = await TelnetServer.StartAsync(options.Port, line => Console.WriteLine(line), options.Bind, options.Trace);
 Console.WriteLine($"fake IBM i listening on {options.Bind} port {host.Port}; Ctrl+C to stop");
 await using var print = options.PrintPort is { } pport
     ? await NetworkPrintServer.StartAsync(pport, line => Console.WriteLine(line), options.Bind)

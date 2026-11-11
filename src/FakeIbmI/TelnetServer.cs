@@ -41,6 +41,7 @@ public sealed class TelnetServer : IAsyncDisposable
 
     private readonly TcpListener _listener;
     private readonly Action<string>? _log;
+    private readonly bool _trace;
     private readonly object _gate = new();
     private readonly HashSet<string> _devices = [];
     private readonly List<ReceivedInput> _inputs = [];
@@ -52,21 +53,25 @@ public sealed class TelnetServer : IAsyncDisposable
     private int _open;
     private int _nextId;
 
-    private TelnetServer(TcpListener listener, Action<string>? log)
+    private TelnetServer(TcpListener listener, Action<string>? log, bool trace)
     {
         _listener = listener;
         _log = log;
+        _trace = trace;
     }
 
     /// <summary>
     /// Listens on the loopback interface, or on <paramref name="address"/> (the demo container
-    /// listens on every interface). Port 0 picks a free port (see <see cref="Port"/>).
+    /// listens on every interface). Port 0 picks a free port (see <see cref="Port"/>). With
+    /// <paramref name="trace"/>, each Telnet negotiation step is logged, and each record's length
+    /// (never its contents, which may hold a password).
     /// </summary>
-    public static Task<TelnetServer> StartAsync(int port = 0, Action<string>? log = null, IPAddress? address = null)
+    public static Task<TelnetServer> StartAsync(
+        int port = 0, Action<string>? log = null, IPAddress? address = null, bool trace = false)
     {
         var listener = new TcpListener(address ?? IPAddress.Loopback, port);
         listener.Start();
-        var host = new TelnetServer(listener, log);
+        var host = new TelnetServer(listener, log, trace);
         host._acceptLoop = host.AcceptLoopAsync();
         return Task.FromResult(host);
     }
@@ -140,6 +145,11 @@ public sealed class TelnetServer : IAsyncDisposable
 
     private void Log(string line) => _log?.Invoke(line);
 
+    private void Trace(int id, string line)
+    {
+        if (_trace) Log($"#{id} {line}");
+    }
+
     private async Task AcceptLoopAsync()
     {
         while (!_stop.IsCancellationRequested)
@@ -190,14 +200,25 @@ public sealed class TelnetServer : IAsyncDisposable
         }
     }
 
-    /// <summary>Runs one session. Returns the device name still held when it ends, if any.</summary>
+    /// <summary>
+    /// Runs one session. Returns the device name still held when it ends, if any.
+    /// It negotiates as an IBM i does: one option at a time, asking for an option's value only once
+    /// the client has agreed to the option (RFC 1091, 1572). NEW-ENVIRON first, then the terminal
+    /// type, then end of record and binary both ways. A client that refuses NEW-ENVIRON still gets
+    /// a session, on a device name made up for it.
+    /// </summary>
     private async Task<string?> ServeAsync(TcpClient client, int id)
     {
         var stream = client.GetStream();
         var decoder = new TelnetDecoder();
         string? requested = null;
-        var terminalType = false;
         var environment = false;
+        var terminalType = false;
+        var environmentRequested = false;
+        var terminalTypeRequested = false;
+        // DO and WILL sent by this side, and the client's WILL and DO.
+        var asked = new HashSet<int>();
+        var offered = new HashSet<int>();
         var clientWill = new HashSet<int>();
         var clientDo = new HashSet<int>();
         var started = false;
@@ -205,7 +226,31 @@ public sealed class TelnetServer : IAsyncDisposable
         var screen = Screen.SignOn;
         var buffer = new byte[4096];
 
-        await stream.WriteAsync(Negotiation, _stop.Token);
+        async Task SendAsync(byte[] bytes, string what)
+        {
+            Trace(id, $"-> {what}");
+            await stream.WriteAsync(bytes, _stop.Token);
+        }
+        Task NegotiateAsync(NegotiationCommand command, int option) =>
+            SendAsync(Telnet.EncodeNegotiation(command, option), $"{CommandText(command)} {Telnet.OptionName(option)}");
+        async Task AskAsync(int option)
+        {
+            if (asked.Add(option)) await NegotiateAsync(NegotiationCommand.Do, option);
+        }
+        async Task OfferAsync(int option)
+        {
+            if (offered.Add(option)) await NegotiateAsync(NegotiationCommand.Will, option);
+        }
+        // The terminal type comes after NEW-ENVIRON: asked for, then its value once the client agrees.
+        async Task TerminalTypeAsync()
+        {
+            await AskAsync(TelnetOption.TerminalType);
+            if (!clientWill.Contains(TelnetOption.TerminalType) || terminalTypeRequested) return;
+            terminalTypeRequested = true;
+            await SendAsync(Telnet.EncodeSubnegotiation(TelnetOption.TerminalType, [1]), "SB TERMINAL-TYPE SEND");
+        }
+
+        await AskAsync(TelnetOption.NewEnviron);
         while (true)
         {
             var count = await stream.ReadAsync(buffer, _stop.Token);
@@ -214,26 +259,91 @@ public sealed class TelnetServer : IAsyncDisposable
             {
                 switch (e)
                 {
-                    case TelnetEvent.Negotiate n when n.Command == NegotiationCommand.Will:
+                    case TelnetEvent.Negotiate n:
+                        Trace(id, $"<- {CommandText(n.Command)} {Telnet.OptionName(n.Option)}");
+                        break;
+                    case TelnetEvent.Subnegotiation s:
+                        Trace(id, $"<- {DescribeSubnegotiation(s)}");
+                        break;
+                    case TelnetEvent.Record r:
+                        Trace(id, $"<- record, {r.Data.Length} bytes{(started ? "" : " (before the session started: ignored)")}");
+                        break;
+                    case TelnetEvent.Control c:
+                        Trace(id, $"<- IAC {c.Code}");
+                        break;
+                }
+
+                switch (e)
+                {
+                    case TelnetEvent.Negotiate { Command: NegotiationCommand.Will } n when Supported(n.Option):
                         clientWill.Add(n.Option);
+                        await AskAsync(n.Option);
+                        if (n.Option == TelnetOption.NewEnviron && !environmentRequested)
+                        {
+                            environmentRequested = true;
+                            // SEND VAR USERVAR: every variable the client has.
+                            await SendAsync(Telnet.EncodeSubnegotiation(TelnetOption.NewEnviron, [1, 0, 3]), "SB NEW-ENVIRON SEND VAR USERVAR");
+                        }
+                        if (n.Option == TelnetOption.TerminalType && environment) await TerminalTypeAsync();
                         break;
-                    case TelnetEvent.Negotiate n when n.Command == NegotiationCommand.Do:
+                    case TelnetEvent.Negotiate { Command: NegotiationCommand.Will } n:
+                        await NegotiateAsync(NegotiationCommand.Dont, n.Option);
+                        break;
+                    case TelnetEvent.Negotiate { Command: NegotiationCommand.Wont } n:
+                        clientWill.Remove(n.Option);
+                        if (n.Option == TelnetOption.NewEnviron && !environment)
+                        {
+                            Log($"#{id} the client won't use NEW-ENVIRON: no device name from it");
+                            environment = true;
+                            await TerminalTypeAsync();
+                        }
+                        else if (!started && n.Option is TelnetOption.TerminalType or TelnetOption.EndOfRecord or TelnetOption.Binary)
+                        {
+                            Log($"#{id} the client won't use {Telnet.OptionName(n.Option)}: it isn't a 5250 client");
+                            return device;
+                        }
+                        break;
+                    case TelnetEvent.Negotiate { Command: NegotiationCommand.Do } n
+                        when n.Option is TelnetOption.EndOfRecord or TelnetOption.Binary:
                         clientDo.Add(n.Option);
+                        await OfferAsync(n.Option);
                         break;
-                    case TelnetEvent.Subnegotiation { Option: TelnetOption.TerminalType } s when s.Data.Length > 0 && s.Data[0] == 0:
-                        terminalType = true;
+                    case TelnetEvent.Negotiate { Command: NegotiationCommand.Do, Option: TelnetOption.TimingMark }:
+                        // RFC 860: the reply is the mark. Clients use it to check the host is there.
+                        await NegotiateAsync(NegotiationCommand.Will, TelnetOption.TimingMark);
                         break;
-                    case TelnetEvent.Subnegotiation { Option: TelnetOption.NewEnviron } s when s.Data.Length > 0 && s.Data[0] == 0:
+                    case TelnetEvent.Negotiate { Command: NegotiationCommand.Do } n:
+                        await NegotiateAsync(NegotiationCommand.Wont, n.Option);
+                        break;
+                    case TelnetEvent.Negotiate { Command: NegotiationCommand.Dont } n:
+                        clientDo.Remove(n.Option);
+                        offered.Remove(n.Option);
+                        if (!started && n.Option is TelnetOption.EndOfRecord or TelnetOption.Binary)
+                        {
+                            Log($"#{id} the client won't take {Telnet.OptionName(n.Option)}: it isn't a 5250 client");
+                            return device;
+                        }
+                        break;
+                    case TelnetEvent.Subnegotiation { Option: TelnetOption.NewEnviron } s
+                        when s.Data.Length > 0 && s.Data[0] == 0 && !environment:
                         environment = true;
-                        requested = ParseDevName(s.Data) ?? requested;
+                        requested = DevName(EnvironmentVariables(s.Data));
+                        await TerminalTypeAsync();
+                        break;
+                    case TelnetEvent.Subnegotiation { Option: TelnetOption.TerminalType } s
+                        when s.Data.Length > 0 && s.Data[0] == 0 && !terminalType:
+                        terminalType = true;
+                        Log($"#{id} terminal type {System.Text.Encoding.ASCII.GetString(s.Data, 1, s.Data.Length - 1)}");
+                        await AskAsync(TelnetOption.EndOfRecord);
+                        await OfferAsync(TelnetOption.EndOfRecord);
+                        await AskAsync(TelnetOption.Binary);
+                        await OfferAsync(TelnetOption.Binary);
                         break;
                     case TelnetEvent.Record r when started:
                         var (next, message) = HandleRecord(r.Data, screen);
                         if (next is null) return device;
                         screen = next.Value;
-                        await stream.WriteAsync(Show(screen, message), _stop.Token);
-                        break;
-                    case TelnetEvent.Record r when !started:
+                        await SendAsync(Show(screen, message), $"screen {screen}");
                         break;
                 }
                 if (started || !terminalType || !environment) continue;
@@ -259,15 +369,45 @@ public sealed class TelnetServer : IAsyncDisposable
                 if (collision is not null)
                 {
                     Log($"#{id} device {collision} is in use");
-                    await stream.WriteAsync(StartupRecord("8902", collision), _stop.Token);
+                    await SendAsync(StartupRecord("8902", collision), "startup response 8902 (device in use)");
                     return null;
                 }
                 Log($"#{id} session started on {device}");
-                await stream.WriteAsync(StartupRecord("I902", device!), _stop.Token);
-                await stream.WriteAsync(Show(Screen.SignOn, null), _stop.Token);
+                await SendAsync(StartupRecord("I902", device!), "startup response I902");
+                await SendAsync(Show(Screen.SignOn, null), $"screen {Screen.SignOn}");
             }
         }
     }
+
+    /// <summary>The options this side takes from the client.</summary>
+    private static bool Supported(int option) =>
+        option is TelnetOption.NewEnviron or TelnetOption.TerminalType or TelnetOption.EndOfRecord or TelnetOption.Binary;
+
+    private static string CommandText(NegotiationCommand command) => command.ToString().ToUpperInvariant();
+
+    /// <summary>
+    /// A subnegotiation for the trace. NEW-ENVIRON variables show their names, and values only for
+    /// those that can't hold a secret (IBMRSEED, IBMSUBSPW and a password-carrying USERVAR can).
+    /// </summary>
+    private static string DescribeSubnegotiation(TelnetEvent.Subnegotiation s)
+    {
+        var verb = s.Data.Length == 0 ? "" : s.Data[0] switch { 0 => " IS", 1 => " SEND", 2 => " INFO", _ => $" {s.Data[0]}" };
+        if (s.Option == TelnetOption.TerminalType && s.Data.Length > 0 && s.Data[0] == 0)
+            return $"SB TERMINAL-TYPE IS {System.Text.Encoding.ASCII.GetString(s.Data, 1, s.Data.Length - 1)}";
+        if (s.Option == TelnetOption.NewEnviron && s.Data.Length > 0 && s.Data[0] is 0 or 2)
+        {
+            var variables = EnvironmentVariables(s.Data).Select(v =>
+                v.Value is null ? $"{v.Kind} {v.Name}"
+                : TraceableVariables.Contains(v.Name) ? $"{v.Kind} {v.Name}={v.Value}"
+                : $"{v.Kind} {v.Name}=({v.Value.Length} characters, not shown)");
+            return $"SB NEW-ENVIRON{verb} {string.Join(", ", variables)}".TrimEnd();
+        }
+        return $"SB {Telnet.OptionName(s.Option)}{verb} ({s.Data.Length} bytes)";
+    }
+
+    private static readonly HashSet<string> TraceableVariables =
+        ["DEVNAME", "KBDTYPE", "CODEPAGE", "CHARSET", "USER", "IBMFONT", "IBMTRANSFORM", "IBMMFRTYPMDL",
+         "IBMMSGQNAME", "IBMMSGQLIB", "IBMASSOCPRT", "IBMPAGESIZE", "IBMWIDTH"];
 
     private string NextDefaultDevice()
     {
@@ -278,24 +418,28 @@ public sealed class TelnetServer : IAsyncDisposable
         }
     }
 
-    /// <summary>The DEVNAME value of a NEW-ENVIRON IS reply, or null.</summary>
-    private static string? ParseDevName(byte[] data)
+    /// <summary>
+    /// The variables of a NEW-ENVIRON IS or INFO (RFC 1572): VAR or USERVAR, name, and value (null
+    /// when none was given). ESC (2) quotes the next byte.
+    /// </summary>
+    private static List<(string Kind, string Name, string? Value)> EnvironmentVariables(byte[] data)
     {
+        var variables = new List<(string Kind, string Name, string? Value)>();
         var name = new List<byte>();
         var value = new List<byte>();
+        string? kind = null;
         var inValue = false;
-        var haveVariable = false;
-        string? found = null;
         void Finish()
         {
-            if (haveVariable && System.Text.Encoding.ASCII.GetString([.. name]) == "DEVNAME")
+            if (kind is not null)
             {
-                found = System.Text.Encoding.ASCII.GetString([.. value]);
+                variables.Add((kind, System.Text.Encoding.ASCII.GetString([.. name]),
+                    inValue ? System.Text.Encoding.ASCII.GetString([.. value]) : null));
             }
             name.Clear();
             value.Clear();
             inValue = false;
-            haveVariable = false;
+            kind = null;
         }
         for (var i = 1; i < data.Length; i++)
         {
@@ -307,7 +451,7 @@ public sealed class TelnetServer : IAsyncDisposable
             else if (b is 0 or 3)
             {
                 Finish();
-                haveVariable = true;
+                kind = b == 0 ? "VAR" : "USERVAR";
             }
             else if (b == 1)
             {
@@ -319,8 +463,12 @@ public sealed class TelnetServer : IAsyncDisposable
             }
         }
         Finish();
-        return string.IsNullOrEmpty(found) ? null : found;
+        return variables;
     }
+
+    /// <summary>The device name the client asks for (DEVNAME), or null.</summary>
+    private static string? DevName(List<(string Kind, string Name, string? Value)> variables) =>
+        variables.FirstOrDefault(v => v.Name == "DEVNAME" && !string.IsNullOrEmpty(v.Value)).Value;
 
     /// <summary>
     /// Applies one client record. Returns the screen to show next (null to close the
@@ -584,19 +732,6 @@ public sealed class TelnetServer : IAsyncDisposable
         byte[] header = [(byte)(length >> 8), (byte)(length & 0xff), 0x12, 0xa0, 0, 0, 4, 0, 0, (byte)opcode];
         return Telnet.EncodeRecord([.. header, .. data]);
     }
-
-    /// <summary>The IBM i side of negotiation, as the real system sends it.</summary>
-    private static readonly byte[] Negotiation =
-    [
-        .. Telnet.EncodeNegotiation(NegotiationCommand.Do, TelnetOption.NewEnviron),
-        .. Telnet.EncodeNegotiation(NegotiationCommand.Do, TelnetOption.TerminalType),
-        .. Telnet.EncodeSubnegotiation(TelnetOption.NewEnviron, [1, 0, 3]),
-        .. Telnet.EncodeSubnegotiation(TelnetOption.TerminalType, [1]),
-        .. Telnet.EncodeNegotiation(NegotiationCommand.Do, TelnetOption.EndOfRecord),
-        .. Telnet.EncodeNegotiation(NegotiationCommand.Will, TelnetOption.EndOfRecord),
-        .. Telnet.EncodeNegotiation(NegotiationCommand.Do, TelnetOption.Binary),
-        .. Telnet.EncodeNegotiation(NegotiationCommand.Will, TelnetOption.Binary),
-    ];
 
     private static byte[] StartupRecord(string code, string deviceName)
     {

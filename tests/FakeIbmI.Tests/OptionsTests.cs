@@ -7,12 +7,17 @@ public class OptionsTests
 {
     [Fact]
     public void ByDefaultItListensOnLoopbackPort2323WithoutAPrintServer() =>
-        Assert.Equal(new Options(2323, null, IPAddress.Loopback), Options.Parse([]));
+        Assert.Equal(new Options(2323, null, IPAddress.Loopback, Trace: false), Options.Parse([]));
 
     [Fact]
     public void TheDemoContainerListensOnEveryInterface() =>
         Assert.Equal(new Options(2323, 8474, IPAddress.Any),
             Options.Parse(["--bind", "0.0.0.0", "--port", "2323", "--print-port", "8474"]));
+
+    [Fact]
+    public void TraceIsASwitch() =>
+        Assert.Equal(new Options(23, null, IPAddress.Any, Trace: true),
+            Options.Parse(["--trace", "--port", "23", "--bind", "0.0.0.0"]));
 
     [Theory]
     [InlineData("--port", "x")]
