@@ -26,9 +26,15 @@ public class OptionsTests
             Options.Parse(["--print-port", "8474", "--signon-port", "8476", "--tls-port", "992", "--signon-tls-port", "9476",
                 "--print-tls-port", "9474", "--tls-cert", "/certs/fake.pfx", "--tls-name", "ibmi.example", "--tls-name", "10.0.0.5"]));
 
+    [Fact]
+    public void TheRemoteCommandServerIsAnOption() =>
+        Assert.Equal(new Options(2323, null, IPAddress.Loopback, CommandPort: 8475, CommandTlsPort: 9475),
+            Options.Parse(["--command-port", "8475", "--command-tls-port", "9475"]));
+
     [Theory]
     [InlineData("--signon-tls-port")]
     [InlineData("--print-tls-port")]
+    [InlineData("--command-tls-port")]
     public void ATlsPortNeedsItsServer(string option) =>
         Assert.Throws<ArgumentException>(() => Options.Parse([option, "9476"]));
 

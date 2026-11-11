@@ -141,6 +141,56 @@ public abstract class HostServer : IAsyncDisposable
         }
     }
 
+    // ---- Start server: how the host servers other than sign-on sign a client on ----
+
+    /// <summary>
+    /// Exchange random seeds (7001, its reply carrying the password level in header byte 5) and
+    /// start server (7002: the scheme byte, then 0x1104 user and 0x1105 substitute), as JTOpen
+    /// opens every host server but sign-on. Returns the profile signed on, or null (logged) when
+    /// it was refused with an IBM i's return code, or with <paramref name="refuse"/> when given.
+    /// </summary>
+    protected async Task<UserProfile?> StartServerAsync(Stream stream, int id, ushort serverId, Users users, int? refuse = null)
+    {
+        var seedRequest = await ReadFrameAsync(stream, Stopping);
+        Require(seedRequest, serverId, 0x7001);
+        var clientSeed = seedRequest.AsSpan(20, 8).ToArray();
+        var serverSeed = System.Security.Cryptography.RandomNumberGenerator.GetBytes(8);
+        var level = users.PasswordLevel;
+        await stream.WriteAsync(Frame(serverId, 0xF001, [0, 0, 0, 0, .. serverSeed], CorrelationOf(seedRequest), (byte)level), Stopping);
+
+        var start = await ReadFrameAsync(stream, Stopping);
+        Require(start, serverId, 0x7002);
+        var scheme = start[20];
+        var points = CodePoints(start);
+        var user = points.TryGetValue(0x1104, out var userId) ? Ebcdic.Decode(userId).TrimEnd() : "";
+        var substitute = points.GetValueOrDefault(0x1105) ?? [];
+
+        int rc;
+        var profile = users.Find(user);
+        if (refuse is { } refused) rc = refused;
+        else if (profile is null) rc = 0x00020001;
+        else if (profile.Disabled) rc = 0x00020002;
+        else if (scheme != (level < 2 ? 0x01 : 0x03)) rc = 0x00010009;
+        else if (!System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(substitute,
+                     Passwords.Substitute(level, Passwords.Token(level, profile.User, profile.Password), profile.User, clientSeed, serverSeed, 1)))
+            rc = 0x0003000B;
+        else rc = profile.PasswordExpired ? 0x0003000D : 0;
+        await stream.WriteAsync(Frame(serverId, 0xF002, BigEndian(rc), CorrelationOf(start)), Stopping);
+        if (rc != 0)
+        {
+            Log($"{LogName} #{id} sign-on refused ({rc:X8})");
+            return null;
+        }
+        Log($"{LogName} #{id} signed on as {profile!.User}");
+        return profile;
+    }
+
+    private static void Require(byte[] frame, ushort serverId, ushort requestId)
+    {
+        if (ServerIdOf(frame) != serverId || RequestIdOf(frame) != requestId)
+            throw new InvalidDataException($"expected request {requestId:X4}");
+    }
+
     // ---- Host server frames: a 20-byte header, a template, then code points ----
 
     /// <summary>

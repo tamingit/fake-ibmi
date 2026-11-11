@@ -89,41 +89,9 @@ public sealed class NetworkPrintServer : HostServer
 
     private async Task<bool> SignOnAsync(Stream stream, int id)
     {
-        var seedRequest = await ReadFrameAsync(stream, Stopping);
-        Require(seedRequest, 0x7001);
-        var clientSeed = seedRequest.AsSpan(20, 8).ToArray();
-        var serverSeed = RandomNumberGenerator.GetBytes(8);
-        var level = PasswordLevel;
-        var seedReply = Frame(ServerId, 0xF001, [0, 0, 0, 0, .. serverSeed], CorrelationOf(seedRequest), (byte)level);
-        await stream.WriteAsync(seedReply, Stopping);
-
-        var start = await ReadFrameAsync(stream, Stopping);
-        Require(start, 0x7002);
-        var scheme = start[20];
-        var points = CodePoints(start);
-        var user = Ebcdic.Decode(points[0x1104]).TrimEnd();
-        var substitute = points[0x1105];
-
-        int rc;
-        var profile = Users.Find(user);
-        if (Refuse is { } refuse) rc = refuse;
-        else if (profile is null) rc = 0x00020001;
-        else if (profile.Disabled) rc = 0x00020002;
-        else if (scheme != (level < 2 ? 0x01 : 0x03)) rc = 0x00010009;
-        else if (!substitute.AsSpan().SequenceEqual(
-                     Passwords.Substitute(level, Passwords.Token(level, profile.User, profile.Password), profile.User, clientSeed, serverSeed, 1)))
-            rc = 0x0003000B;
-        else rc = profile.PasswordExpired ? 0x0003000D : 0;
-        await stream.WriteAsync(Frame(ServerId, 0xF002, BigEndian(rc), CorrelationOf(start)), Stopping);
-        if (rc != 0)
-        {
-            Interlocked.Increment(ref _refusals);
-            Log($"print #{id} sign-on refused ({rc:X8})");
-            return false;
-        }
-        Interlocked.Increment(ref _signOns);
-        Log($"print #{id} signed on as {user}");
-        return true;
+        var profile = await StartServerAsync(stream, id, ServerId, Users, Refuse);
+        Interlocked.Increment(ref profile is null ? ref _refusals : ref _signOns);
+        return profile is not null;
     }
 
     // ---- Network Print requests, after sign-on ----
@@ -299,13 +267,6 @@ public sealed class NetworkPrintServer : HostServer
             result[id] = type == 3 ? BinaryPrimitives.ReadInt32BigEndian(value) : Ebcdic.Decode(value.TrimEnd((byte)0));
         }
         return result;
-    }
-
-    private static void Require(byte[] frame, ushort requestId)
-    {
-        if (BinaryPrimitives.ReadUInt16BigEndian(frame.AsSpan(6)) != ServerId
-            || BinaryPrimitives.ReadUInt16BigEndian(frame.AsSpan(18)) != requestId)
-            throw new InvalidDataException($"expected request {requestId:X4}");
     }
 }
 

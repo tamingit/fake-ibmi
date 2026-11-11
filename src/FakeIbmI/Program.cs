@@ -1,10 +1,13 @@
 // Runs the scripted fake IBM i until Ctrl+C:
-//   dotnet run --project src/FakeIbmI -- --port 2323 [--print-port 8474] [--signon-port 8476]
+//   dotnet run --project src/FakeIbmI -- --port 2323 [--print-port 8474] [--signon-port 8476] [--command-port 8475]
 //       [--mapper-port 449] [--env-file .env] [--bind 0.0.0.0] [--trace]
 // --print-port also runs its Network Print server (printer output), for PRTUSER / Secret12.
 // --signon-port also runs its sign-on server, for the same user and password, which it can change.
+// --command-port also runs its remote command server, which answers every command and program call
+//     with success (and zeros for output), running nothing.
 // --mapper-port also runs its port mapper, which tells clients the other servers' ports.
-// --tls-port, --signon-tls-port and --print-tls-port add TLS ports (IBM's: 992, 9476, 9474).
+// --tls-port, --signon-tls-port, --print-tls-port and --command-tls-port add TLS ports
+//     (IBM's: 992, 9476, 9474, 9475).
 //     --tls-cert names a PKCS #12 file for them, made (with a .crt to trust) when it's missing;
 //     without it, a certificate is made for this run only. --tls-name adds names to one it makes.
 // --env-file reads settings from a file (default: .env, when there is one); the environment wins.
@@ -44,7 +47,14 @@ try
         : null;
     if (signon is not null) Console.WriteLine($"fake sign-on server listening on port {signon.Port}{TlsText(signon.TlsPort)}");
 
+    await using var command = options.CommandPort is { } commandPort
+        ? await RemoteCommandServer.StartAsync(commandPort, Log, options.Bind, users, TlsOn(options.CommandTlsPort))
+        : null;
+    if (command is not null) Console.WriteLine($"fake remote command server listening on port {command.Port}{TlsText(command.TlsPort)}");
+
     var services = new Dictionary<string, int>();
+    if (command is not null) services["as-rmtcmd"] = command.Port;
+    if (command?.TlsPort is { } commandTls) services["as-rmtcmd-s"] = commandTls;
     if (print is not null) services["as-netprt"] = print.Port;
     if (print?.TlsPort is { } printTls) services["as-netprt-s"] = printTls;
     if (signon is not null) services["as-signon"] = signon.Port;
