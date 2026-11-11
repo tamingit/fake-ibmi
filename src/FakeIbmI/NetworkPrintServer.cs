@@ -1,62 +1,66 @@
 // A scripted fake of the IBM i Network Print server (as-netprt, server ID E003) for automated
 // tests: the random seed exchange and Start Server, checking one placeholder user and password
-// with the DES (QPWDLVL 0-1) or SHA-1 (2-3) password substitute. It checks substitutes its own
-// way (the DES one as a CBC MAC), not with the server's code. It never logs a substitute.
+// (its UserProfile) with the DES (QPWDLVL 0-1) or SHA-1 (2-3) password substitute. It checks
+// substitutes its own way (see Passwords), not with the server's code. It never logs a substitute.
 
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
-using System.Text;
 
 namespace FakeIbmI;
 
-public sealed class NetworkPrintServer : IAsyncDisposable
+public sealed class NetworkPrintServer : HostServer
 {
-    public const string DefaultUser = "PRTUSER";
-    public const string DefaultPassword = "Secret12";
+    public const string DefaultUser = UserProfile.DefaultUser;
+    public const string DefaultPassword = UserProfile.DefaultPassword;
 
     private const ushort ServerId = 0xE003;
 
-    private readonly TcpListener _listener;
-    private readonly Action<string>? _log;
-    private readonly object _gate = new();
-    private readonly List<Task> _tasks = [];
-    private readonly HashSet<TcpClient> _clients = [];
-    private readonly CancellationTokenSource _stop = new();
-    private Task _acceptLoop = Task.CompletedTask;
     private int _signOns;
     private int _refusals;
-    private int _nextId;
 
-    private NetworkPrintServer(TcpListener listener, Action<string>? log)
+    private NetworkPrintServer(int port, Action<string>? log, IPAddress? address, UserProfile? profile)
+        : base(port, log, address)
     {
-        _listener = listener;
-        _log = log;
+        Profile = profile ?? new UserProfile();
     }
 
     /// <summary>
     /// Listens on the loopback interface, or on <paramref name="address"/> (the demo container
-    /// listens on every interface). Port 0 picks a free port (see <see cref="Port"/>).
+    /// listens on every interface). Port 0 picks a free port (see <see cref="HostServer.Port"/>).
+    /// Pass the sign-on server's <paramref name="profile"/> to share its user and password.
     /// </summary>
-    public static Task<NetworkPrintServer> StartAsync(int port = 0, Action<string>? log = null, IPAddress? address = null)
+    public static Task<NetworkPrintServer> StartAsync(int port = 0, Action<string>? log = null, IPAddress? address = null,
+        UserProfile? profile = null)
     {
-        var listener = new TcpListener(address ?? IPAddress.Loopback, port);
-        listener.Start();
-        var server = new NetworkPrintServer(listener, log);
-        server._acceptLoop = server.AcceptLoopAsync();
+        var server = new NetworkPrintServer(port, log, address, profile);
+        server.Start();
         return Task.FromResult(server);
     }
 
-    public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
+    /// <summary>The user profile it signs on.</summary>
+    public UserProfile Profile { get; }
 
     /// <summary>The one user that may sign on, upper case.</summary>
-    public string User { get; set; } = DefaultUser;
+    public string User
+    {
+        get => Profile.User;
+        set => Profile.User = value;
+    }
 
-    public string Password { get; set; } = DefaultPassword;
+    public string Password
+    {
+        get => Profile.Password;
+        set => Profile.Password = value;
+    }
 
     /// <summary>QPWDLVL: 0 or 1 for DES substitutes, 2 or 3 for SHA-1.</summary>
-    public int PasswordLevel { get; set; } = 2;
+    public int PasswordLevel
+    {
+        get => Profile.PasswordLevel;
+        set => Profile.PasswordLevel = value;
+    }
 
     /// <summary>When set, Start Server answers with this return code whatever is sent.</summary>
     public int? Refuse { get; set; }
@@ -67,90 +71,39 @@ public sealed class NetworkPrintServer : IAsyncDisposable
     /// <summary>Refused sign-ons so far.</summary>
     public int Refusals => Volatile.Read(ref _refusals);
 
-    public async ValueTask DisposeAsync()
-    {
-        _stop.Cancel();
-        _listener.Stop();
-        TcpClient[] clients;
-        lock (_gate) clients = [.. _clients];
-        foreach (var client in clients) client.Close();
-        try
-        {
-            await _acceptLoop;
-        }
-        catch (Exception e) when (e is ObjectDisposedException or SocketException or OperationCanceledException)
-        {
-        }
-        Task[] tasks;
-        lock (_gate) tasks = [.. _tasks];
-        await Task.WhenAll(tasks);
-        _stop.Dispose();
-    }
-
-    private void Log(string line) => _log?.Invoke(line);
-
-    private async Task AcceptLoopAsync()
-    {
-        while (!_stop.IsCancellationRequested)
-        {
-            TcpClient client;
-            try
-            {
-                client = await _listener.AcceptTcpClientAsync(_stop.Token);
-            }
-            catch (Exception e) when (e is ObjectDisposedException or SocketException or OperationCanceledException)
-            {
-                return;
-            }
-            var id = Interlocked.Increment(ref _nextId);
-            lock (_gate)
-            {
-                _clients.Add(client);
-                _tasks.Add(Task.Run(() => RunAsync(client, id)));
-            }
-        }
-    }
-
-    private async Task RunAsync(TcpClient client, int id)
+    protected override async Task ServeAsync(NetworkStream stream, int id)
     {
         try
         {
             Log($"print #{id} connected");
-            var stream = client.GetStream();
             if (!await SignOnAsync(stream, id)) return;
             var open = new Dictionary<int, (SpooledFile File, int Offset)>();
             while (true)
             {
-                var request = await ReadFrameAsync(stream, _stop.Token);
-                foreach (var reply in Answer(request, open)) await stream.WriteAsync(reply, _stop.Token);
+                var request = await ReadFrameAsync(stream, Stopping);
+                foreach (var reply in Answer(request, open)) await stream.WriteAsync(reply, Stopping);
             }
-        }
-        catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException or OperationCanceledException
-                                      or EndOfStreamException or InvalidDataException)
-        {
         }
         finally
         {
-            lock (_gate) _clients.Remove(client);
-            client.Close();
             Log($"print #{id} closed");
         }
     }
 
     private async Task<bool> SignOnAsync(NetworkStream stream, int id)
     {
-        var seedRequest = await ReadFrameAsync(stream, _stop.Token);
+        var seedRequest = await ReadFrameAsync(stream, Stopping);
         Require(seedRequest, 0x7001);
         var clientSeed = seedRequest.AsSpan(20, 8).ToArray();
         var serverSeed = RandomNumberGenerator.GetBytes(8);
         var level = PasswordLevel;
-        var seedReply = Frame(0xF001, [0, 0, 0, 0, .. serverSeed], (byte)level);
-        await stream.WriteAsync(seedReply, _stop.Token);
+        var seedReply = Frame(ServerId, 0xF001, [0, 0, 0, 0, .. serverSeed], CorrelationOf(seedRequest), (byte)level);
+        await stream.WriteAsync(seedReply, Stopping);
 
-        var start = await ReadFrameAsync(stream, _stop.Token);
+        var start = await ReadFrameAsync(stream, Stopping);
         Require(start, 0x7002);
         var scheme = start[20];
-        var points = CodePoints(start, 20 + BinaryPrimitives.ReadUInt16BigEndian(start.AsSpan(16)));
+        var points = CodePoints(start);
         var user = Ebcdic.Decode(points[0x1104]).TrimEnd();
         var substitute = points[0x1105];
 
@@ -158,8 +111,10 @@ public sealed class NetworkPrintServer : IAsyncDisposable
         if (Refuse is { } refuse) rc = refuse;
         else if (user != User) rc = 0x00020001;
         else if (scheme != (level < 2 ? 0x01 : 0x03)) rc = 0x00010009;
-        else rc = substitute.AsSpan().SequenceEqual(Expected(level, clientSeed, serverSeed)) ? 0 : 0x0003000B;
-        await stream.WriteAsync(Frame(0xF002, [(byte)(rc >> 24), (byte)(rc >> 16), (byte)(rc >> 8), (byte)rc]), _stop.Token);
+        else if (!substitute.AsSpan().SequenceEqual(Passwords.Substitute(level, Passwords.Token(level, User, Password), User, clientSeed, serverSeed, 1)))
+            rc = 0x0003000B;
+        else rc = Profile.PasswordExpired ? 0x0003000D : 0;
+        await stream.WriteAsync(Frame(ServerId, 0xF002, BigEndian(rc), CorrelationOf(start)), Stopping);
         if (rc != 0)
         {
             Interlocked.Increment(ref _refusals);
@@ -182,7 +137,7 @@ public sealed class NetworkPrintServer : IAsyncDisposable
         var objectType = BinaryPrimitives.ReadUInt16BigEndian(request.AsSpan(18));
         var correlation = BinaryPrimitives.ReadInt32BigEndian(request.AsSpan(12));
         var action = BinaryPrimitives.ReadUInt16BigEndian(request.AsSpan(20));
-        var points = CodePoints(request, 20 + BinaryPrimitives.ReadUInt16BigEndian(request.AsSpan(16)));
+        var points = CodePoints(request);
         Interlocked.Increment(ref _requests);
 
         byte[] Reply(int rc, bool last = true, params (int Id, byte[] Data)[] codePoints) =>
@@ -346,126 +301,11 @@ public sealed class NetworkPrintServer : IAsyncDisposable
         return result;
     }
 
-    private static byte[] BigEndian(int value)
-    {
-        var bytes = new byte[4];
-        BinaryPrimitives.WriteInt32BigEndian(bytes, value);
-        return bytes;
-    }
-
-    private byte[] Expected(int level, byte[] clientSeed, byte[] serverSeed)
-    {
-        var id = User.PadRight(10);
-        if (level >= 2)
-        {
-            var idBytes = Encoding.BigEndianUnicode.GetBytes(id);
-            var token = SHA1.HashData([.. idBytes, .. Encoding.BigEndianUnicode.GetBytes(Password)]);
-            return SHA1.HashData([.. token, .. serverSeed, .. clientSeed, .. idBytes, 0, 0, 0, 0, 0, 0, 0, 1]);
-        }
-
-        // DES: the token enciphers the (folded) user ID under the password, shifted; the
-        // substitute is a CBC MAC under the token over five blocks.
-        var userId = Ebcdic.Encode(id);
-        var password = Password.ToUpperInvariant();
-        if (char.IsAsciiDigit(password[0])) password = "Q" + password;
-        var pwd = Ebcdic.Encode(password.PadRight(10));
-        var folded = Fold(userId);
-        var length = Array.FindIndex(pwd, b => b == 0x40) is var n and >= 0 ? n : 10;
-        var desToken = Des(Key(pwd.AsSpan(0, Math.Min(8, length))), folded);
-        if (length > 8)
-        {
-            var second = Des(Key(pwd.AsSpan(8, length - 8)), folded);
-            desToken = BitConverter.GetBytes(BitConverter.ToUInt64(desToken) ^ BitConverter.ToUInt64(second));
-        }
-        var seq = BinaryPrimitives.ReadUInt64BigEndian(serverSeed) + 1;
-        var rdr = new byte[8];
-        BinaryPrimitives.WriteUInt64BigEndian(rdr, seq);
-        byte[] blocks =
-        [
-            .. rdr,
-            .. clientSeed,
-            .. userId.Take(8).Select((b, i) => (byte)(b ^ rdr[i])),
-            .. new byte[] { userId[8], userId[9], 0x40, 0x40, 0x40, 0x40, 0x40, 0x40 }.Select((b, i) => (byte)(b ^ rdr[i])),
-            0, 0, 0, 0, 0, 0, 0, 1,
-        ];
-        using var des = System.Security.Cryptography.DES.Create();
-        des.Key = desToken;
-        return des.EncryptCbc(blocks, new byte[8], PaddingMode.None)[^8..];
-    }
-
-    /// <summary>Characters 9 and 10 of a long user ID, two bits at a time, into the top of bytes 1 to 8.</summary>
-    private static byte[] Fold(byte[] userId)
-    {
-        var folded = userId[..8];
-        if (userId[8] == 0x40) return folded;
-        for (var bit = 0; bit < 16; bit += 2)
-        {
-            var source = userId[8 + bit / 8];
-            var pair = (source >> (6 - bit % 8)) & 0x03;
-            folded[bit / 2] ^= (byte)(pair << 6);
-        }
-        return folded;
-    }
-
-    private static byte[] Key(ReadOnlySpan<byte> part)
-    {
-        var block = new byte[8];
-        block.AsSpan().Fill(0x40);
-        part.CopyTo(block);
-        var value = (BinaryPrimitives.ReadUInt64BigEndian(block) ^ 0x5555555555555555UL) << 1;
-        BinaryPrimitives.WriteUInt64BigEndian(block, value);
-        return block;
-    }
-
-    private static byte[] Des(byte[] key, byte[] block)
-    {
-        using var des = System.Security.Cryptography.DES.Create();
-        des.Key = key;
-        return des.EncryptEcb(block, PaddingMode.None);
-    }
-
-    private static Dictionary<int, byte[]> CodePoints(byte[] frame, int at)
-    {
-        var points = new Dictionary<int, byte[]>();
-        while (at + 6 <= frame.Length)
-        {
-            var length = BinaryPrimitives.ReadInt32BigEndian(frame.AsSpan(at));
-            if (length < 6 || at + length > frame.Length) throw new InvalidDataException("bad code point");
-            points[BinaryPrimitives.ReadUInt16BigEndian(frame.AsSpan(at + 4))] = frame.AsSpan(at + 6, length - 6).ToArray();
-            at += length;
-        }
-        return points;
-    }
-
     private static void Require(byte[] frame, ushort requestId)
     {
         if (BinaryPrimitives.ReadUInt16BigEndian(frame.AsSpan(6)) != ServerId
             || BinaryPrimitives.ReadUInt16BigEndian(frame.AsSpan(18)) != requestId)
             throw new InvalidDataException($"expected request {requestId:X4}");
-    }
-
-    private static byte[] Frame(ushort replyId, byte[] template, byte serverAttributes = 0)
-    {
-        var frame = new byte[20 + template.Length];
-        BinaryPrimitives.WriteInt32BigEndian(frame, frame.Length);
-        frame[5] = serverAttributes;
-        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(6), ServerId);
-        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(16), (ushort)template.Length);
-        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(18), replyId);
-        template.CopyTo(frame, 20);
-        return frame;
-    }
-
-    private static async Task<byte[]> ReadFrameAsync(NetworkStream stream, CancellationToken cancel)
-    {
-        var header = new byte[20];
-        await stream.ReadExactlyAsync(header, cancel);
-        var length = BinaryPrimitives.ReadInt32BigEndian(header);
-        if (length < 20 || length > 1 << 20) throw new InvalidDataException("bad length");
-        var frame = new byte[length];
-        header.CopyTo(frame, 0);
-        await stream.ReadExactlyAsync(frame.AsMemory(20), cancel);
-        return frame;
     }
 }
 

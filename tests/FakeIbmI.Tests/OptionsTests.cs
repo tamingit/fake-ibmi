@@ -6,13 +6,13 @@ namespace FakeIbmI.Tests;
 public class OptionsTests
 {
     [Fact]
-    public void ByDefaultItListensOnLoopbackPort2323WithoutAPrintServer() =>
+    public void ByDefaultItListensOnLoopbackPort2323WithoutHostServers() =>
         Assert.Equal(new Options(2323, null, IPAddress.Loopback, Trace: false), Options.Parse([]));
 
     [Fact]
     public void TheDemoContainerListensOnEveryInterface() =>
-        Assert.Equal(new Options(2323, 8474, IPAddress.Any),
-            Options.Parse(["--bind", "0.0.0.0", "--port", "2323", "--print-port", "8474"]));
+        Assert.Equal(new Options(2323, 8474, IPAddress.Any, SignonPort: 8476, MapperPort: 449),
+            Options.Parse(["--bind", "0.0.0.0", "--port", "2323", "--print-port", "8474", "--signon-port", "8476", "--mapper-port", "449"]));
 
     [Fact]
     public void TraceIsASwitch() =>
@@ -22,6 +22,8 @@ public class OptionsTests
     [Theory]
     [InlineData("--port", "x")]
     [InlineData("--print-port", "x")]
+    [InlineData("--signon-port", "x")]
+    [InlineData("--mapper-port", "70000")]
     [InlineData("--bind", "not-an-address")]
     public void ABadValueStopsTheStart(string option, string value) =>
         Assert.Throws<ArgumentException>(() => Options.Parse([option, value]));
