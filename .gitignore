@@ -10,3 +10,6 @@ TestResults/
 
 # Claude Code local files
 .claude/
+
+# local settings, such as the users (.env.example is the template)
+.env

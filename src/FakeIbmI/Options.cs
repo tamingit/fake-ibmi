@@ -8,11 +8,13 @@ namespace FakeIbmI;
 /// (loopback; the container passes 0.0.0.0 so it can be reached from outside it) and --trace
 /// (log each Telnet negotiation step, and each record's length). For TLS: --tls-port,
 /// --signon-tls-port and --print-tls-port (each none), --tls-cert (a PKCS #12 file, made when
-/// missing) and --tls-name (more names for a certificate it makes, comma-separated).
+/// missing) and --tls-name (more names for a certificate it makes, comma-separated). --env-file
+/// names the file of settings, such as the users (default: .env, when there is one).
 /// </summary>
 public sealed record Options(
     int Port, int? PrintPort, IPAddress Bind, bool Trace = false, int? SignonPort = null, int? MapperPort = null,
-    int? TlsPort = null, int? SignonTlsPort = null, int? PrintTlsPort = null, string? TlsCert = null, string? TlsNames = null)
+    int? TlsPort = null, int? SignonTlsPort = null, int? PrintTlsPort = null, string? TlsCert = null, string? TlsNames = null,
+    string? EnvFile = null)
 {
     /// <summary>Whether any server listens for TLS, and so needs a certificate.</summary>
     public bool AnyTls => TlsPort is not null || SignonTlsPort is not null || PrintTlsPort is not null;
@@ -42,6 +44,7 @@ public sealed record Options(
                 "--signon-tls-port" => options with { SignonTlsPort = PortValue() },
                 "--print-tls-port" => options with { PrintTlsPort = PortValue() },
                 "--tls-cert" => options with { TlsCert = value },
+                "--env-file" => options with { EnvFile = value },
                 "--tls-name" => options with { TlsNames = options.TlsNames is null ? value : $"{options.TlsNames},{value}" },
                 "--bind" => options with
                 {

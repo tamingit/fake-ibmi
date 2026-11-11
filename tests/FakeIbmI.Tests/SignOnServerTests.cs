@@ -19,10 +19,11 @@ public class SignOnServerTests
 
     private static async Task<SignOnServer> StartAsync(int level = 2, string user = "PRTUSER", string password = "Secret12")
     {
-        var server = await SignOnServer.StartAsync();
-        server.Profile.PasswordLevel = level;
-        server.Profile.User = user;
-        server.Profile.Password = password;
+        var users = new Users(new UserProfile(user, password), new UserProfile("LOCKUSER", password, disabled: true))
+        {
+            PasswordLevel = level,
+        };
+        var server = await SignOnServer.StartAsync(users: users);
         server.ServerSeeds = () => ServerSeed;
         return server;
     }
@@ -97,6 +98,21 @@ public class SignOnServerTests
     }
 
     [Fact]
+    public async Task ADisabledUserIsRefusedEvenWithItsPassword()
+    {
+        // LOCKUSER's password is Secret12 too, so this is its right substitute... for user PRTUSER. The
+        // fake answers before it checks the substitute, as an IBM i does for a disabled profile.
+        await using var server = await StartAsync();
+        await using var client = await Client.ConnectAsync(server.Port);
+        await client.ExchangeAttributesAsync();
+
+        var reply = await client.SignOnAsync(2, "LOCKUSER", "68C71B05D26AFAF4E78E0BA7CFFFB8BBAF94ABB8");
+
+        Assert.Equal(0x00020002, ReturnCode(reply));
+        Assert.Equal(1, server.Refusals);
+    }
+
+    [Fact]
     public async Task ADesSubstituteAtASha1LevelIsRefused()
     {
         await using var server = await StartAsync(level: 2);
@@ -122,7 +138,7 @@ public class SignOnServerTests
         int level, string newPassword, string substitute, string oldProtected, string newProtected, int oldLength, int newLength)
     {
         await using var server = await StartAsync(level);
-        server.Profile.PasswordExpired = true;
+        server.Users.Main.PasswordExpired = true;
         await using var client = await Client.ConnectAsync(server.Port);
         await client.ExchangeAttributesAsync();
 
@@ -130,8 +146,8 @@ public class SignOnServerTests
 
         Assert.Equal(0xF005, RequestId(reply));
         Assert.Equal(0, ReturnCode(reply));
-        Assert.Equal(newPassword, server.Profile.Password);
-        Assert.False(server.Profile.PasswordExpired);
+        Assert.Equal(newPassword, server.Users.Main.Password);
+        Assert.False(server.Users.Main.PasswordExpired);
         Assert.Equal(1, server.PasswordChanges);
     }
 
@@ -147,14 +163,14 @@ public class SignOnServerTests
             "EBF4A8BB493216E7D49BFBADFD5EFCA13958482C", "A5EE1B745DE42693C13B81AD21C2B93FD6B75A4F", 16, 18);
 
         Assert.Equal(PasswordIncorrect, ReturnCode(reply));
-        Assert.Equal("Secret12", server.Profile.Password);
+        Assert.Equal("Secret12", server.Users.Main.Password);
     }
 
     [Fact]
     public async Task AnExpiredPasswordSaysSoOnlyOnceItIsRight()
     {
         await using var server = await StartAsync();
-        server.Profile.PasswordExpired = true;
+        server.Users.Main.PasswordExpired = true;
         await using var client = await Client.ConnectAsync(server.Port);
         await client.ExchangeAttributesAsync();
 
@@ -165,9 +181,9 @@ public class SignOnServerTests
     [Fact]
     public async Task APasswordChangedThroughSignOnHoldsForNetworkPrint()
     {
-        var profile = new UserProfile();
-        await using var signon = await SignOnServer.StartAsync(profile: profile);
-        await using var print = await NetworkPrintServer.StartAsync(profile: profile);
+        var users = Users.Defaults();
+        await using var signon = await SignOnServer.StartAsync(users: users);
+        await using var print = await NetworkPrintServer.StartAsync(users: users);
         signon.ServerSeeds = () => ServerSeed;
         await using var client = await Client.ConnectAsync(signon.Port);
         await client.ExchangeAttributesAsync();

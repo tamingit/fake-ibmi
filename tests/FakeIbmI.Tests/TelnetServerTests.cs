@@ -57,7 +57,7 @@ public class TelnetServerTests
         await using var host = await TelnetServer.StartAsync();
         await using var client = await TestClient.ConnectAsync(host, "GGTEST001");
 
-        await SignOnAsync(client, "TESTUSER", "secret-pw");
+        await SignOnAsync(client, "prtuser", "Secret12");
         await client.WaitForTextAsync("IBM i Main Menu");
         var text = client.Text();
         Assert.Contains("MAIN", text);
@@ -66,15 +66,15 @@ public class TelnetServerTests
 
         var input = Assert.Single(host.Inputs);
         Assert.Equal(0xf1, input.Aid);
-        Assert.Equal("TESTUSER", input.FieldAt(6, 53));
-        Assert.DoesNotContain("secret-pw", input.FieldAt(7, 53));
-        Assert.Equal(9, input.FieldAt(7, 53)!.Length);
+        Assert.Equal("PRTUSER", input.FieldAt(6, 53)); // the user field is monocase
+        Assert.DoesNotContain("Secret12", input.FieldAt(7, 53));
+        Assert.Equal(8, input.FieldAt(7, 53)!.Length);
 
         await client.PressAsync(new FunctionKey("F3"));
         await client.WaitForTextAsync("Sign On");
         Assert.Equal(0x33, host.Inputs[^1].Aid);
 
-        await SignOnAsync(client, "TESTUSER", "x");
+        await SignOnAsync(client, "PRTUSER", "Secret12");
         await client.WaitForTextAsync("IBM i Main Menu");
         await client.TypeAsync("90");
         await client.EnterAsync();
@@ -88,7 +88,7 @@ public class TelnetServerTests
     {
         await using var host = await TelnetServer.StartAsync();
         await using var client = await TestClient.ConnectAsync(host, "GGTEST001");
-        await SignOnAsync(client, "TESTUSER", "x");
+        await SignOnAsync(client, "PRTUSER", "Secret12");
         await client.WaitForTextAsync("IBM i Main Menu");
         await client.TypeAsync(" SignOff ");
         await client.EnterAsync();
@@ -105,7 +105,7 @@ public class TelnetServerTests
         await client.EnterAsync();
         await client.WaitForTextAsync("User required");
 
-        await SignOnAsync(client, "TESTUSER", "x");
+        await SignOnAsync(client, "PRTUSER", "Secret12");
         await client.WaitForTextAsync("IBM i Main Menu");
         await client.PressAsync(Click(20, 7));
         await client.TypeAsync("77");

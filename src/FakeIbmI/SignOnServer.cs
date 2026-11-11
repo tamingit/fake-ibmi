@@ -4,7 +4,7 @@
 //   7004 sign-on info        -> F004: return code; on success, sign-on dates and the server CCSID
 //   7005 change password     -> F005: return code
 //   7006 end job             -> closes, no reply
-// It checks passwords against its UserProfile with the DES (QPWDLVL 0-1) or SHA-1 (2-3)
+// It checks passwords against the system's Users with the DES (QPWDLVL 0-1) or SHA-1 (2-3)
 // substitute (see Passwords). Tokens and Kerberos aren't supported. It never logs a password,
 // a substitute or a protected password.
 
@@ -34,6 +34,7 @@ public sealed class SignOnServer : HostServer
     private const int RequestIdNotValid = 0x00010003;
     private const int RequestDataNotValid = 0x00010009;
     private const int UserIdUnknown = 0x00020001;
+    private const int UserIdDisabled = 0x00020002;
     private const int NewPasswordTooLong = 0x00030001;
     private const int NewPasswordTooShort = 0x00030002;
     private const int NewPasswordPreviouslyUsed = 0x00030006;
@@ -44,27 +45,27 @@ public sealed class SignOnServer : HostServer
     private int _refusals;
     private int _passwordChanges;
 
-    private SignOnServer(int port, Action<string>? log, IPAddress? address, UserProfile? profile, TlsOptions? tls)
+    private SignOnServer(int port, Action<string>? log, IPAddress? address, Users? users, TlsOptions? tls)
         : base(port, log, address, tls)
     {
-        Profile = profile ?? new UserProfile();
+        Users = users ?? Users.Defaults();
     }
 
     /// <summary>
     /// Listens on the loopback interface, or on <paramref name="address"/>. Port 0 picks a free port
-    /// (see <see cref="HostServer.Port"/>). Pass the Network Print server's <paramref name="profile"/>
-    /// to share its user and password. With <paramref name="tls"/>, it also listens for TLS.
+    /// (see <see cref="HostServer.Port"/>). Pass the other servers' <paramref name="users"/> to share
+    /// them (the default is <see cref="Users.Defaults"/>). With <paramref name="tls"/>, it also listens for TLS.
     /// </summary>
     public static Task<SignOnServer> StartAsync(int port = 0, Action<string>? log = null, IPAddress? address = null,
-        UserProfile? profile = null, TlsOptions? tls = null)
+        Users? users = null, TlsOptions? tls = null)
     {
-        var server = new SignOnServer(port, log, address, profile, tls);
+        var server = new SignOnServer(port, log, address, users, tls);
         server.Start();
         return Task.FromResult(server);
     }
 
-    /// <summary>The user profile it signs on, and changes the password of.</summary>
-    public UserProfile Profile { get; }
+    /// <summary>The user profiles it signs on, and changes the passwords of.</summary>
+    public Users Users { get; }
 
     /// <summary>Makes each connection's server seed. Random unless a test fixes it.</summary>
     public Func<byte[]> ServerSeeds { get; set; } = () => RandomNumberGenerator.GetBytes(8);
@@ -91,7 +92,7 @@ public sealed class SignOnServer : HostServer
         // A client signing on with a password sends its seed; one using a token doesn't.
         var clientSeed = CodePoints(exchange).GetValueOrDefault(0x1103) ?? new byte[8];
         var serverSeed = ServerSeeds();
-        var level = Profile.PasswordLevel;
+        var level = Users.PasswordLevel;
         await stream.WriteAsync(Frame(ServerId, 0xF003, BigEndian(0), CorrelationOf(exchange), 0,
             (0x1101, BigEndian(ServerVersion)),
             (0x1102, [ServerLevel >> 8, ServerLevel & 0xFF]),
@@ -143,8 +144,8 @@ public sealed class SignOnServer : HostServer
     {
         var points = CodePoints(request);
         var user = points.TryGetValue(0x1104, out var userId) ? Ebcdic.Decode(userId).TrimEnd() : "";
-        var rc = Check(request, points, session, user);
-        if (rc == 0 && Profile.PasswordExpired) rc = PasswordExpired;
+        var (rc, profile) = Check(request, points, session, user);
+        if (rc == 0 && profile!.PasswordExpired) rc = PasswordExpired;
         if (rc != 0)
         {
             Interlocked.Increment(ref _refusals);
@@ -166,40 +167,45 @@ public sealed class SignOnServer : HostServer
         var points = CodePoints(request);
         var user = points.TryGetValue(0x1104, out var userId) ? Ebcdic.Decode(userId).TrimEnd() : "";
         string? newPassword = null;
-        var rc = Check(request, points, session, user);
-        if (rc == 0) rc = NewPassword(points, session, user, out newPassword);
+        var (rc, profile) = Check(request, points, session, user);
+        if (rc == 0) rc = NewPassword(points, session, profile!, out newPassword);
         if (rc != 0 || newPassword is null)
         {
             Interlocked.Increment(ref _refusals);
             Log($"signon #{session.Id} password change refused ({rc:X8})");
             return rc;
         }
-        Profile.ChangePassword(newPassword);
+        profile!.ChangePassword(newPassword);
         Interlocked.Increment(ref _passwordChanges);
         Log($"signon #{session.Id} password changed for {user}");
         return 0;
     }
 
-    /// <summary>Whether the request's user and substitute match the profile: 0, or the return code.</summary>
-    private int Check(byte[] request, Dictionary<int, byte[]> points, Session session, string user)
+    /// <summary>
+    /// Whether the request's user and substitute match a profile: 0 with it, or the return code. A
+    /// disabled profile is refused whatever the password, as on an IBM i.
+    /// </summary>
+    private (int Rc, UserProfile? Profile) Check(byte[] request, Dictionary<int, byte[]> points, Session session, string user)
     {
-        if (Refuse is { } refuse) return refuse;
-        if (user != Profile.User) return UserIdUnknown;
-        if (request.Length < 21 || request[20] != (session.Level < 2 ? 0x01 : 0x03)) return RequestDataNotValid;
-        if (!points.TryGetValue(0x1105, out var substitute)) return RequestDataNotValid;
-        var token = Passwords.Token(session.Level, user, Profile.Password);
-        var expected = Passwords.Substitute(session.Level, token, user, session.ClientSeed, session.ServerSeed, 1);
-        return CryptographicOperations.FixedTimeEquals(substitute, expected) ? 0 : PasswordIncorrect;
+        if (Refuse is { } refuse) return (refuse, null);
+        if (Users.Find(user) is not { } profile) return (UserIdUnknown, null);
+        if (profile.Disabled) return (UserIdDisabled, profile);
+        if (request.Length < 21 || request[20] != (session.Level < 2 ? 0x01 : 0x03)) return (RequestDataNotValid, profile);
+        if (!points.TryGetValue(0x1105, out var substitute)) return (RequestDataNotValid, profile);
+        var token = Passwords.Token(session.Level, profile.User, profile.Password);
+        var expected = Passwords.Substitute(session.Level, token, profile.User, session.ClientSeed, session.ServerSeed, 1);
+        return (CryptographicOperations.FixedTimeEquals(substitute, expected) ? 0 : PasswordIncorrect, profile);
     }
 
     /// <summary>The new password from a change whose substitute checked out: 0 with it, or the return code.</summary>
-    private int NewPassword(Dictionary<int, byte[]> points, Session session, string user, out string? newPassword)
+    private int NewPassword(Dictionary<int, byte[]> points, Session session, UserProfile profile, out string? newPassword)
     {
         newPassword = null;
+        var user = profile.User;
         var level = session.Level;
         if (!points.TryGetValue(0x110C, out var oldProtected) || !points.TryGetValue(0x110D, out var newProtected))
             return RequestDataNotValid;
-        var oldPassword = Profile.Password;
+        var oldPassword = profile.Password;
         int oldLength, newLength;
         if (level >= 2)
         {

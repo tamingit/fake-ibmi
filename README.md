@@ -13,7 +13,8 @@ It was split out of [GreenGlow Connect](https://github.com/tamingit/greenglow), 
 - **Negotiation:** TN5250E, one option at a time as an IBM i does it: NEW-ENVIRON, then the terminal type, then end of record and binary. It asks for a value only once the client has agreed to the option. A client that refuses NEW-ENVIRON still gets a session.
 - **Device names:** it honours the device name a client asks for (`DEVNAME`). Without one, it makes one up. A name already in use gets the Startup Response Record's error code, as on a real system.
 - **Screens:**
-  - **Sign-on:** any user name signs on, and the password is ignored. A blank user gets "User required".
+  - **Sign-on:** checks the user and password against the [users](#users), with an IBM i's messages for an unknown user, a wrong password or a disabled profile. The password field is case-sensitive.
+  - **Change Password:** the expired user goes on to this screen, which needs the current password and the new one twice. F3 or F12 goes back to sign-on.
   - **Main menu:**
     - `4`: a list of placeholder items, three pages long, paged with Page Up and Page Down.
     - `132`: a 27 × 132 screen.
@@ -23,7 +24,7 @@ It was split out of [GreenGlow Connect](https://github.com/tamingit/greenglow), 
 
 **Host servers**
 
-The host servers share one user profile: user `PRTUSER`, password `Secret12`, password level 2. Password levels 0 and 1 use DES; 2 and 3 use SHA-1. A password changed through the sign-on server holds for Network Print too, until the fake stops.
+Password levels 0 and 1 use DES; 2 and 3 use SHA-1. The fake runs at level 2.
 
 - **Port mapper (port 449):** tells a client which port a service is on, as JTOpen and ACS ask before connecting to a host server. It knows `as-signon` and `as-netprt` when they run, and answers that there's no such service for anything else, including the TLS names (`as-signon-s`). It logs each name asked, so the log shows which services a client wants.
 - **Sign-on (port 8476):**
@@ -32,9 +33,23 @@ The host servers share one user profile: user `PRTUSER`, password `Secret12`, pa
   - **Not supported:** profile tokens, Kerberos and multi-factor authentication.
 - **Network Print (port 8474):** it lists placeholder spooled files and sends their contents.
 
+<a id="users"></a>**Users**
+
+Every server checks sign-ons against the same three users: the 5250 sign-on screen, the sign-on server and Network Print. A password changed through any of them holds for all of them, until the fake stops.
+
+| User | Password | Signing on with the right password |
+|---|---|---|
+| `PRTUSER` | `Secret12` | Signs on. |
+| `EXPUSER` | `Expired1` | The password has expired. The 5250 screen goes on to Change Password; the sign-on server answers `0003000D` until the password is changed through it. |
+| `LOCKUSER` | `Locked12` | The profile is disabled, so it can't sign on with any password. The 5250 screen says "User profile LOCKUSER cannot sign on."; the host servers answer `00020002`. |
+
+- **Setting them:** copy `.env.example` to `.env` and change the names and passwords. The fake reads `.env` from the directory it starts in, or the file `--env-file` names. Variables set in the environment win over the file. For Docker, pass the file with `--env-file .env`, or leave that out to use the defaults.
+- **Values:** write them without quotes, as Docker keeps quotes as part of the value. A user name is up to 10 characters. A password can be up to 27 characters on the 5250 sign-on screen, and up to 128 for the host servers.
+- **Logs:** the fake logs who signed on and why a sign-on was refused, but never a password.
+
 **TLS**
 
-As on an IBM i, TLS is a second port for the same server: Telnet on 992, sign-on on 9476, Network Print on 9474. A TLS session shares everything with a session on the plain port: device names, and the user profile. The port mapper stays unencrypted on 449, and tells clients the TLS ports when they ask for `as-signon-s` or `as-netprt-s`.
+As on an IBM i, TLS is a second port for the same server: Telnet on 992, sign-on on 9476, Network Print on 9474. A TLS session shares everything with a session on the plain port: device names, and the users. The port mapper stays unencrypted on 449, and tells clients the TLS ports when they ask for `as-signon-s` or `as-netprt-s`.
 
 - **Certificate:** `--tls-cert` names a PKCS #12 file without a password. If the file doesn't exist, the fake makes a self-signed certificate there, good for 397 days, and writes its public part beside it as PEM (the same name, ending `.crt`) for clients to trust. Without `--tls-cert`, it makes a certificate that lasts only until it stops.
 - **Names:** a certificate the fake makes is for `localhost`, `127.0.0.1`, `::1`, the machine's name and the `--bind` address. `--tls-name` adds more, such as the name or address clients connect to.
@@ -46,7 +61,7 @@ As on an IBM i, TLS is a second port for the same server: Telnet on 992, sign-on
 Docker:
 
 ```bash
-docker run --rm -v fake-ibmi-certs:/certs \
+docker run --rm --env-file .env -v fake-ibmi-certs:/certs \
   -p 127.0.0.1:2323:2323 -p 127.0.0.1:992:992 -p 127.0.0.1:8474:8474 -p 127.0.0.1:9474:9474 \
   -p 127.0.0.1:8476:8476 -p 127.0.0.1:9476:9476 -p 127.0.0.1:449:449 ghcr.io/tamingit/fake-ibmi
 ```
@@ -70,6 +85,7 @@ Port 449 is below 1024, so outside a container the fake needs root, or `CAP_NET_
   - `--tls-port`, `--signon-tls-port`, `--print-tls-port`: TLS ports for Telnet, sign-on and Network Print (default: none). The last two need `--signon-port` and `--print-port`.
   - `--tls-cert`: the certificate for the TLS ports (default: one made for this run only).
   - `--tls-name`: another name or address for a certificate the fake makes. Repeat it, or separate names with commas.
+  - `--env-file`: the file of settings, such as the [users](#users) (default: `.env`, when there is one).
   - `--bind`: the address to listen on (default `127.0.0.1`).
   - `--trace`: logs each Telnet negotiation step, and each record's length. It never logs a record's contents, or the value of a NEW-ENVIRON variable that can hold a secret (`IBMSUBSPW`, `IBMRSEED`).
 - **Listening address:** by default it listens on loopback only. The image passes `--bind 0.0.0.0` so it can be reached from outside the container. Publish it on `127.0.0.1`, as above, unless you mean other machines to reach it.
@@ -80,14 +96,14 @@ ACS doesn't only use the 5250 port. It signs on to the sign-on server first, for
 
 1. Start the fake where the PC running ACS can reach it, with the trace on. Docker is easiest, because it can listen on 449 without root (arguments after the image name are added to the image's own):
    ```bash
-   docker run --rm -p 2323:2323 -p 8474:8474 -p 8476:8476 -p 449:449 ghcr.io/tamingit/fake-ibmi:beta --trace
+   docker run --rm --env-file .env -p 2323:2323 -p 8474:8474 -p 8476:8476 -p 449:449 ghcr.io/tamingit/fake-ibmi:beta --trace
    ```
    Or, as root or with `CAP_NET_BIND_SERVICE`:
    ```bash
    dotnet run --project src/FakeIbmI -- --port 2323 --signon-port 8476 --mapper-port 449 --bind 0.0.0.0 --trace
    ```
 2. In ACS, make a 5250 session with this machine's address as the system, port 2323, and SSL off. For TLS, use port 992 with SSL on, and turn on SSL in the system's connection settings too. ACS must trust the fake's certificate first: import `fake-ibmi.crt` into ACS's key store, under Tools, then Key Management. If ACS connects by a name or address the certificate isn't for, add it with `--tls-name` and make a new certificate.
-3. When ACS asks for a user and password, use `PRTUSER` and `Secret12`. On the 5250 sign-on screen itself, any user name signs on and the password is ignored.
+3. Sign on as one of the [users](#users), both when ACS asks for a user and password and on the 5250 sign-on screen.
 
 If it doesn't connect, the log shows how far ACS got:
 

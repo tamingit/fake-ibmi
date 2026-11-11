@@ -1,6 +1,6 @@
 // A scripted fake of the IBM i Network Print server (as-netprt, server ID E003) for automated
 // tests: the random seed exchange and Start Server, checking one placeholder user and password
-// (its UserProfile) with the DES (QPWDLVL 0-1) or SHA-1 (2-3) password substitute. It checks
+// (the system's Users) with the DES (QPWDLVL 0-1) or SHA-1 (2-3) password substitute. It checks
 // substitutes its own way (see Passwords), not with the server's code. It never logs a substitute.
 
 using System.Buffers.Binary;
@@ -12,55 +12,57 @@ namespace FakeIbmI;
 
 public sealed class NetworkPrintServer : HostServer
 {
-    public const string DefaultUser = UserProfile.DefaultUser;
-    public const string DefaultPassword = UserProfile.DefaultPassword;
+    public const string DefaultUser = Users.DefaultUser;
+    public const string DefaultPassword = Users.DefaultPassword;
 
     private const ushort ServerId = 0xE003;
 
     private int _signOns;
     private int _refusals;
 
-    private NetworkPrintServer(int port, Action<string>? log, IPAddress? address, UserProfile? profile, TlsOptions? tls)
+    private NetworkPrintServer(int port, Action<string>? log, IPAddress? address, Users? users, TlsOptions? tls)
         : base(port, log, address, tls)
     {
-        Profile = profile ?? new UserProfile();
+        Users = users ?? Users.Defaults();
     }
 
     /// <summary>
     /// Listens on the loopback interface, or on <paramref name="address"/> (the demo container
     /// listens on every interface). Port 0 picks a free port (see <see cref="HostServer.Port"/>).
-    /// Pass the sign-on server's <paramref name="profile"/> to share its user and password. With
+    /// Pass the other servers' <paramref name="users"/> to share them (the default is
+    /// <see cref="Users.Defaults"/>). With
     /// <paramref name="tls"/>, it also listens for TLS.
     /// </summary>
     public static Task<NetworkPrintServer> StartAsync(int port = 0, Action<string>? log = null, IPAddress? address = null,
-        UserProfile? profile = null, TlsOptions? tls = null)
+        Users? users = null, TlsOptions? tls = null)
     {
-        var server = new NetworkPrintServer(port, log, address, profile, tls);
+        var server = new NetworkPrintServer(port, log, address, users, tls);
         server.Start();
         return Task.FromResult(server);
     }
 
-    /// <summary>The user profile it signs on.</summary>
-    public UserProfile Profile { get; }
+    /// <summary>The user profiles it signs on.</summary>
+    public Users Users { get; }
 
-    /// <summary>The one user that may sign on, upper case.</summary>
+    /// <summary>The main user's name (see <see cref="Users.Main"/>), upper case.</summary>
     public string User
     {
-        get => Profile.User;
-        set => Profile.User = value;
+        get => Users.Main.User;
+        set => Users.Main.User = value;
     }
 
+    /// <summary>The main user's password.</summary>
     public string Password
     {
-        get => Profile.Password;
-        set => Profile.Password = value;
+        get => Users.Main.Password;
+        set => Users.Main.Password = value;
     }
 
     /// <summary>QPWDLVL: 0 or 1 for DES substitutes, 2 or 3 for SHA-1.</summary>
     public int PasswordLevel
     {
-        get => Profile.PasswordLevel;
-        set => Profile.PasswordLevel = value;
+        get => Users.PasswordLevel;
+        set => Users.PasswordLevel = value;
     }
 
     /// <summary>When set, Start Server answers with this return code whatever is sent.</summary>
@@ -103,12 +105,15 @@ public sealed class NetworkPrintServer : HostServer
         var substitute = points[0x1105];
 
         int rc;
+        var profile = Users.Find(user);
         if (Refuse is { } refuse) rc = refuse;
-        else if (user != User) rc = 0x00020001;
+        else if (profile is null) rc = 0x00020001;
+        else if (profile.Disabled) rc = 0x00020002;
         else if (scheme != (level < 2 ? 0x01 : 0x03)) rc = 0x00010009;
-        else if (!substitute.AsSpan().SequenceEqual(Passwords.Substitute(level, Passwords.Token(level, User, Password), User, clientSeed, serverSeed, 1)))
+        else if (!substitute.AsSpan().SequenceEqual(
+                     Passwords.Substitute(level, Passwords.Token(level, profile.User, profile.Password), profile.User, clientSeed, serverSeed, 1)))
             rc = 0x0003000B;
-        else rc = Profile.PasswordExpired ? 0x0003000D : 0;
+        else rc = profile.PasswordExpired ? 0x0003000D : 0;
         await stream.WriteAsync(Frame(ServerId, 0xF002, BigEndian(rc), CorrelationOf(start)), Stopping);
         if (rc != 0)
         {
