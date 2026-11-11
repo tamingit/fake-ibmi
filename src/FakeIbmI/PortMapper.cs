@@ -39,7 +39,12 @@ public sealed class PortMapper : HostServer
     /// <summary>Questions answered so far, mapped or not.</summary>
     public int Lookups => Volatile.Read(ref _lookups);
 
-    protected override async Task ServeAsync(NetworkStream stream, int id)
+    protected override string LogName => "mapper";
+
+    /// <summary>Its one line per question is enough.</summary>
+    protected override bool LogsConnections => false;
+
+    protected override async Task ServeAsync(Stream stream, int id, bool tls)
     {
         // The name is whatever the first read brings, as on an IBM i: clients send it in one write.
         var buffer = new byte[64];

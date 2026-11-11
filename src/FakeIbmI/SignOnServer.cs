@@ -44,8 +44,8 @@ public sealed class SignOnServer : HostServer
     private int _refusals;
     private int _passwordChanges;
 
-    private SignOnServer(int port, Action<string>? log, IPAddress? address, UserProfile? profile)
-        : base(port, log, address)
+    private SignOnServer(int port, Action<string>? log, IPAddress? address, UserProfile? profile, TlsOptions? tls)
+        : base(port, log, address, tls)
     {
         Profile = profile ?? new UserProfile();
     }
@@ -53,12 +53,12 @@ public sealed class SignOnServer : HostServer
     /// <summary>
     /// Listens on the loopback interface, or on <paramref name="address"/>. Port 0 picks a free port
     /// (see <see cref="HostServer.Port"/>). Pass the Network Print server's <paramref name="profile"/>
-    /// to share its user and password.
+    /// to share its user and password. With <paramref name="tls"/>, it also listens for TLS.
     /// </summary>
     public static Task<SignOnServer> StartAsync(int port = 0, Action<string>? log = null, IPAddress? address = null,
-        UserProfile? profile = null)
+        UserProfile? profile = null, TlsOptions? tls = null)
     {
-        var server = new SignOnServer(port, log, address, profile);
+        var server = new SignOnServer(port, log, address, profile, tls);
         server.Start();
         return Task.FromResult(server);
     }
@@ -81,60 +81,54 @@ public sealed class SignOnServer : HostServer
     /// <summary>Successful password changes so far.</summary>
     public int PasswordChanges => Volatile.Read(ref _passwordChanges);
 
-    protected override async Task ServeAsync(NetworkStream stream, int id)
-    {
-        Log($"signon #{id} connected");
-        try
-        {
-            var exchange = await ReadFrameAsync(stream, Stopping);
-            if (ServerIdOf(exchange) != ServerId || RequestIdOf(exchange) != 0x7003)
-                throw new InvalidDataException("expected exchange attributes");
-            // A client signing on with a password sends its seed; one using a token doesn't.
-            var clientSeed = CodePoints(exchange).GetValueOrDefault(0x1103) ?? new byte[8];
-            var serverSeed = ServerSeeds();
-            var level = Profile.PasswordLevel;
-            await stream.WriteAsync(Frame(ServerId, 0xF003, BigEndian(0), CorrelationOf(exchange), 0,
-                (0x1101, BigEndian(ServerVersion)),
-                (0x1102, [ServerLevel >> 8, ServerLevel & 0xFF]),
-                (0x1103, serverSeed),
-                (0x1119, [(byte)level]),
-                (0x111F, [.. BigEndian(Ccsid), .. Ebcdic.Encode($"{100000 + id % 900000}/QUSER/QZSOSIGN")])), Stopping);
+    protected override string LogName => "signon";
 
-            var session = new Session(id, clientSeed, serverSeed, level);
-            while (true)
-            {
-                var request = await ReadFrameAsync(stream, Stopping);
-                if (ServerIdOf(request) != ServerId) throw new InvalidDataException("not a sign-on request");
-                var correlation = CorrelationOf(request);
-                switch (RequestIdOf(request))
-                {
-                    case 0x7004:
-                    {
-                        var (rc, user) = SignOn(request, session);
-                        await stream.WriteAsync(rc == 0
-                            ? Frame(ServerId, 0xF004, BigEndian(0), correlation, 0,
-                                (0x1106, Date(DateTime.Now)),
-                                (0x1107, Date(session.LastSignOn ?? DateTime.Now)),
-                                (0x1114, BigEndian(Ccsid)),
-                                (0x1104, [.. BigEndian(Ccsid), .. Ebcdic.Encode(user.PadRight(10))]))
-                            : Frame(ServerId, 0xF004, BigEndian(rc), correlation), Stopping);
-                        if (rc == 0) session.LastSignOn = DateTime.Now;
-                        break;
-                    }
-                    case 0x7005:
-                        await stream.WriteAsync(Frame(ServerId, 0xF005, BigEndian(ChangePassword(request, session)), correlation), Stopping);
-                        break;
-                    case 0x7006:
-                        return;
-                    default:
-                        await stream.WriteAsync(Frame(ServerId, (ushort)(RequestIdOf(request) | 0x8000), BigEndian(RequestIdNotValid), correlation), Stopping);
-                        break;
-                }
-            }
-        }
-        finally
+    protected override async Task ServeAsync(Stream stream, int id, bool tls)
+    {
+        var exchange = await ReadFrameAsync(stream, Stopping);
+        if (ServerIdOf(exchange) != ServerId || RequestIdOf(exchange) != 0x7003)
+            throw new InvalidDataException("expected exchange attributes");
+        // A client signing on with a password sends its seed; one using a token doesn't.
+        var clientSeed = CodePoints(exchange).GetValueOrDefault(0x1103) ?? new byte[8];
+        var serverSeed = ServerSeeds();
+        var level = Profile.PasswordLevel;
+        await stream.WriteAsync(Frame(ServerId, 0xF003, BigEndian(0), CorrelationOf(exchange), 0,
+            (0x1101, BigEndian(ServerVersion)),
+            (0x1102, [ServerLevel >> 8, ServerLevel & 0xFF]),
+            (0x1103, serverSeed),
+            (0x1119, [(byte)level]),
+            (0x111F, [.. BigEndian(Ccsid), .. Ebcdic.Encode($"{100000 + id % 900000}/QUSER/QZSOSIGN")])), Stopping);
+
+        var session = new Session(id, clientSeed, serverSeed, level);
+        while (true)
         {
-            Log($"signon #{id} closed");
+            var request = await ReadFrameAsync(stream, Stopping);
+            if (ServerIdOf(request) != ServerId) throw new InvalidDataException("not a sign-on request");
+            var correlation = CorrelationOf(request);
+            switch (RequestIdOf(request))
+            {
+                case 0x7004:
+                {
+                    var (rc, user) = SignOn(request, session);
+                    await stream.WriteAsync(rc == 0
+                        ? Frame(ServerId, 0xF004, BigEndian(0), correlation, 0,
+                            (0x1106, Date(DateTime.Now)),
+                            (0x1107, Date(session.LastSignOn ?? DateTime.Now)),
+                            (0x1114, BigEndian(Ccsid)),
+                            (0x1104, [.. BigEndian(Ccsid), .. Ebcdic.Encode(user.PadRight(10))]))
+                        : Frame(ServerId, 0xF004, BigEndian(rc), correlation), Stopping);
+                    if (rc == 0) session.LastSignOn = DateTime.Now;
+                    break;
+                }
+                case 0x7005:
+                    await stream.WriteAsync(Frame(ServerId, 0xF005, BigEndian(ChangePassword(request, session)), correlation), Stopping);
+                    break;
+                case 0x7006:
+                    return;
+                default:
+                    await stream.WriteAsync(Frame(ServerId, (ushort)(RequestIdOf(request) | 0x8000), BigEndian(RequestIdNotValid), correlation), Stopping);
+                    break;
+            }
         }
     }
 

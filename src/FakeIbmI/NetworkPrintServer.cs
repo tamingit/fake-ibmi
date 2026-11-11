@@ -20,8 +20,8 @@ public sealed class NetworkPrintServer : HostServer
     private int _signOns;
     private int _refusals;
 
-    private NetworkPrintServer(int port, Action<string>? log, IPAddress? address, UserProfile? profile)
-        : base(port, log, address)
+    private NetworkPrintServer(int port, Action<string>? log, IPAddress? address, UserProfile? profile, TlsOptions? tls)
+        : base(port, log, address, tls)
     {
         Profile = profile ?? new UserProfile();
     }
@@ -29,12 +29,13 @@ public sealed class NetworkPrintServer : HostServer
     /// <summary>
     /// Listens on the loopback interface, or on <paramref name="address"/> (the demo container
     /// listens on every interface). Port 0 picks a free port (see <see cref="HostServer.Port"/>).
-    /// Pass the sign-on server's <paramref name="profile"/> to share its user and password.
+    /// Pass the sign-on server's <paramref name="profile"/> to share its user and password. With
+    /// <paramref name="tls"/>, it also listens for TLS.
     /// </summary>
     public static Task<NetworkPrintServer> StartAsync(int port = 0, Action<string>? log = null, IPAddress? address = null,
-        UserProfile? profile = null)
+        UserProfile? profile = null, TlsOptions? tls = null)
     {
-        var server = new NetworkPrintServer(port, log, address, profile);
+        var server = new NetworkPrintServer(port, log, address, profile, tls);
         server.Start();
         return Task.FromResult(server);
     }
@@ -71,26 +72,20 @@ public sealed class NetworkPrintServer : HostServer
     /// <summary>Refused sign-ons so far.</summary>
     public int Refusals => Volatile.Read(ref _refusals);
 
-    protected override async Task ServeAsync(NetworkStream stream, int id)
+    protected override string LogName => "print";
+
+    protected override async Task ServeAsync(Stream stream, int id, bool tls)
     {
-        try
+        if (!await SignOnAsync(stream, id)) return;
+        var open = new Dictionary<int, (SpooledFile File, int Offset)>();
+        while (true)
         {
-            Log($"print #{id} connected");
-            if (!await SignOnAsync(stream, id)) return;
-            var open = new Dictionary<int, (SpooledFile File, int Offset)>();
-            while (true)
-            {
-                var request = await ReadFrameAsync(stream, Stopping);
-                foreach (var reply in Answer(request, open)) await stream.WriteAsync(reply, Stopping);
-            }
-        }
-        finally
-        {
-            Log($"print #{id} closed");
+            var request = await ReadFrameAsync(stream, Stopping);
+            foreach (var reply in Answer(request, open)) await stream.WriteAsync(reply, Stopping);
         }
     }
 
-    private async Task<bool> SignOnAsync(NetworkStream stream, int id)
+    private async Task<bool> SignOnAsync(Stream stream, int id)
     {
         var seedRequest = await ReadFrameAsync(stream, Stopping);
         Require(seedRequest, 0x7001);

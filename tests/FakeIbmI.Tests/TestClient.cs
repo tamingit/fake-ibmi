@@ -1,4 +1,6 @@
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 
 using FakeIbmI.Tests.Client;
 
@@ -14,7 +16,7 @@ internal sealed class TestClient : IAsyncDisposable
     private readonly object _gate = new();
     private readonly List<ConnectionEvent> _events = [];
     private Task _pump = Task.CompletedTask;
-    private NetworkStream? _stream;
+    private Stream? _stream;
 
     public TestClient(string? device)
     {
@@ -30,6 +32,38 @@ internal sealed class TestClient : IAsyncDisposable
         client._stream = client._tcp.GetStream();
         client._pump = Task.Run(client.PumpAsync);
         return client;
+    }
+
+    /// <summary>Connects to the TLS port, trusting only <paramref name="trusted"/>, for the name localhost.</summary>
+    public static async Task<TestClient> ConnectTlsAsync(TelnetServer host, string? device, X509Certificate2 trusted)
+    {
+        var client = new TestClient(device);
+        await client._tcp.ConnectAsync("127.0.0.1", host.TlsPort!.Value);
+        var tls = new SslStream(client._tcp.GetStream());
+        await tls.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+        {
+            TargetHost = "localhost",
+            CertificateChainPolicy = Trusting(trusted),
+        });
+        client._stream = tls;
+        client._pump = Task.Run(client.PumpAsync);
+        return client;
+    }
+
+    /// <summary>A chain policy that trusts this one certificate and nothing else.</summary>
+    public static X509ChainPolicy Trusting(X509Certificate2 trusted)
+    {
+        var policy = new X509ChainPolicy { TrustMode = X509ChainTrustMode.CustomRootTrust, RevocationMode = X509RevocationMode.NoCheck };
+        policy.CustomTrustStore.Add(X509CertificateLoader.LoadCertificate(trusted.RawData));
+        return policy;
+    }
+
+    /// <summary>Drops the connection with a reset, as a client that crashed or lost its network would.</summary>
+    public async Task AbortAsync()
+    {
+        _tcp.Client.LingerState = new LingerOption(true, 0);
+        _tcp.Close();
+        await _pump;
     }
 
     public List<ConnectionEvent> Events

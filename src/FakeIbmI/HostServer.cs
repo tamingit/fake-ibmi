@@ -1,5 +1,6 @@
-// What the fake's host servers (port mapper, sign-on, Network Print) have in common: a listener
-// that runs each client until it or the server closes, and the host server data stream's frames.
+// What the fake's host servers (port mapper, sign-on, Network Print) have in common: a listener,
+// and optionally a second one for TLS, that runs each client until it or the server closes, and
+// the host server data stream's frames.
 
 using System.Buffers.Binary;
 using System.Net;
@@ -10,49 +11,78 @@ namespace FakeIbmI;
 public abstract class HostServer : IAsyncDisposable
 {
     private readonly TcpListener _listener;
+    private readonly TcpListener? _tlsListener;
+    private readonly TlsOptions? _tls;
     private readonly Action<string>? _log;
     private readonly object _gate = new();
     private readonly List<Task> _tasks = [];
     private readonly HashSet<TcpClient> _clients = [];
     private readonly CancellationTokenSource _stop = new();
-    private Task _acceptLoop = Task.CompletedTask;
+    private Task[] _acceptLoops = [];
     private int _nextId;
 
     /// <summary>
     /// Listens on the loopback interface, or on <paramref name="address"/> (the demo container
-    /// listens on every interface). Port 0 picks a free port (see <see cref="Port"/>).
+    /// listens on every interface). Port 0 picks a free port (see <see cref="Port"/>). With
+    /// <paramref name="tls"/>, it also listens for TLS on that port (see <see cref="TlsPort"/>).
     /// </summary>
-    protected HostServer(int port, Action<string>? log, IPAddress? address)
+    protected HostServer(int port, Action<string>? log, IPAddress? address, TlsOptions? tls = null)
     {
         _listener = new TcpListener(address ?? IPAddress.Loopback, port);
+        if (tls is not null) _tlsListener = new TcpListener(address ?? IPAddress.Loopback, tls.Port);
+        _tls = tls;
         _log = log;
     }
 
     public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
+
+    /// <summary>The TLS port, when it listens for TLS.</summary>
+    public int? TlsPort => (_tlsListener?.LocalEndpoint as IPEndPoint)?.Port;
+
+    /// <summary>The name its log lines start with.</summary>
+    protected abstract string LogName { get; }
+
+    /// <summary>Whether it logs each connection opening and closing.</summary>
+    protected virtual bool LogsConnections => true;
 
     protected CancellationToken Stopping => _stop.Token;
 
     protected void Start()
     {
         _listener.Start();
-        _acceptLoop = AcceptLoopAsync();
+        try
+        {
+            _tlsListener?.Start();
+        }
+        catch
+        {
+            _listener.Stop();
+            throw;
+        }
+        _acceptLoops = _tlsListener is null
+            ? [AcceptLoopAsync(_listener, tls: false)]
+            : [AcceptLoopAsync(_listener, tls: false), AcceptLoopAsync(_tlsListener, tls: true)];
     }
 
     protected void Log(string line) => _log?.Invoke(line);
 
-    /// <summary>Serves one client. Returning, or a dropped or malformed connection, closes it.</summary>
-    protected abstract Task ServeAsync(NetworkStream stream, int id);
+    /// <summary>
+    /// Serves one client, over TLS when <paramref name="tls"/> (the handshake is done). Returning,
+    /// or a dropped or malformed connection, closes it.
+    /// </summary>
+    protected abstract Task ServeAsync(Stream stream, int id, bool tls);
 
     public async ValueTask DisposeAsync()
     {
         _stop.Cancel();
         _listener.Stop();
+        _tlsListener?.Stop();
         TcpClient[] clients;
         lock (_gate) clients = [.. _clients];
         foreach (var client in clients) client.Close();
         try
         {
-            await _acceptLoop;
+            await Task.WhenAll(_acceptLoops);
         }
         catch (Exception e) when (e is ObjectDisposedException or SocketException or OperationCanceledException)
         {
@@ -63,14 +93,14 @@ public abstract class HostServer : IAsyncDisposable
         _stop.Dispose();
     }
 
-    private async Task AcceptLoopAsync()
+    private async Task AcceptLoopAsync(TcpListener listener, bool tls)
     {
         while (!_stop.IsCancellationRequested)
         {
             TcpClient client;
             try
             {
-                client = await _listener.AcceptTcpClientAsync(_stop.Token);
+                client = await listener.AcceptTcpClientAsync(_stop.Token);
             }
             catch (Exception e) when (e is ObjectDisposedException or SocketException or OperationCanceledException)
             {
@@ -80,16 +110,24 @@ public abstract class HostServer : IAsyncDisposable
             lock (_gate)
             {
                 _clients.Add(client);
-                _tasks.Add(Task.Run(() => RunAsync(client, id)));
+                _tasks.Add(Task.Run(() => RunAsync(client, id, tls)));
             }
         }
     }
 
-    private async Task RunAsync(TcpClient client, int id)
+    private async Task RunAsync(TcpClient client, int id, bool tls)
     {
+        if (LogsConnections) Log($"{LogName} #{id} connected{(tls ? " (TLS)" : "")}");
         try
         {
-            await ServeAsync(client.GetStream(), id);
+            if (!tls)
+            {
+                await ServeAsync(client.GetStream(), id, tls: false);
+                return;
+            }
+            await using var secure = await Tls.AcceptAsync(client.GetStream(), _tls!.Certificate, $"{LogName} #{id}",
+                Log, _stop.Token);
+            if (secure is not null) await ServeAsync(secure, id, tls: true);
         }
         catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException or OperationCanceledException
                                       or EndOfStreamException or InvalidDataException)
@@ -99,6 +137,7 @@ public abstract class HostServer : IAsyncDisposable
         {
             lock (_gate) _clients.Remove(client);
             client.Close();
+            if (LogsConnections) Log($"{LogName} #{id} closed");
         }
     }
 
@@ -160,7 +199,7 @@ public abstract class HostServer : IAsyncDisposable
         return bytes;
     }
 
-    protected static async Task<byte[]> ReadFrameAsync(NetworkStream stream, CancellationToken cancel)
+    protected static async Task<byte[]> ReadFrameAsync(Stream stream, CancellationToken cancel)
     {
         var header = new byte[20];
         await stream.ReadExactlyAsync(header, cancel);

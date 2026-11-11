@@ -4,6 +4,7 @@
 
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 
 namespace FakeIbmI;
 
@@ -40,6 +41,8 @@ public sealed class TelnetServer : IAsyncDisposable
     }
 
     private readonly TcpListener _listener;
+    private readonly TcpListener? _tlsListener;
+    private readonly TlsOptions? _tls;
     private readonly Action<string>? _log;
     private readonly bool _trace;
     private readonly object _gate = new();
@@ -48,14 +51,16 @@ public sealed class TelnetServer : IAsyncDisposable
     private readonly List<Task> _tasks = [];
     private readonly HashSet<TcpClient> _clients = [];
     private readonly CancellationTokenSource _stop = new();
-    private Task _acceptLoop = Task.CompletedTask;
+    private Task[] _acceptLoops = [];
     private int _connections;
     private int _open;
     private int _nextId;
 
-    private TelnetServer(TcpListener listener, Action<string>? log, bool trace)
+    private TelnetServer(TcpListener listener, TcpListener? tlsListener, TlsOptions? tls, Action<string>? log, bool trace)
     {
         _listener = listener;
+        _tlsListener = tlsListener;
+        _tls = tls;
         _log = log;
         _trace = trace;
     }
@@ -64,19 +69,35 @@ public sealed class TelnetServer : IAsyncDisposable
     /// Listens on the loopback interface, or on <paramref name="address"/> (the demo container
     /// listens on every interface). Port 0 picks a free port (see <see cref="Port"/>). With
     /// <paramref name="trace"/>, each Telnet negotiation step is logged, and each record's length
-    /// (never its contents, which may hold a password).
+    /// (never its contents, which may hold a password). With <paramref name="tls"/>, it also
+    /// listens for Telnet over TLS (an IBM i uses port 992), with the same sessions and devices.
     /// </summary>
     public static Task<TelnetServer> StartAsync(
-        int port = 0, Action<string>? log = null, IPAddress? address = null, bool trace = false)
+        int port = 0, Action<string>? log = null, IPAddress? address = null, bool trace = false, TlsOptions? tls = null)
     {
         var listener = new TcpListener(address ?? IPAddress.Loopback, port);
+        var tlsListener = tls is null ? null : new TcpListener(address ?? IPAddress.Loopback, tls.Port);
         listener.Start();
-        var host = new TelnetServer(listener, log, trace);
-        host._acceptLoop = host.AcceptLoopAsync();
+        try
+        {
+            tlsListener?.Start();
+        }
+        catch
+        {
+            listener.Stop();
+            throw;
+        }
+        var host = new TelnetServer(listener, tlsListener, tls, log, trace);
+        host._acceptLoops = tlsListener is null
+            ? [host.AcceptLoopAsync(listener, tls: false)]
+            : [host.AcceptLoopAsync(listener, tls: false), host.AcceptLoopAsync(tlsListener, tls: true)];
         return Task.FromResult(host);
     }
 
     public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
+
+    /// <summary>The TLS port, when it listens for TLS.</summary>
+    public int? TlsPort => (_tlsListener?.LocalEndpoint as IPEndPoint)?.Port;
 
     /// <summary>Connections accepted so far.</summary>
     public int Connections => Volatile.Read(ref _connections);
@@ -118,10 +139,11 @@ public sealed class TelnetServer : IAsyncDisposable
     {
         _stop.Cancel();
         _listener.Stop();
+        _tlsListener?.Stop();
         await CloseAllAsync();
         try
         {
-            await _acceptLoop;
+            await Task.WhenAll(_acceptLoops);
         }
         catch (Exception e) when (e is ObjectDisposedException or SocketException or OperationCanceledException)
         {
@@ -150,14 +172,14 @@ public sealed class TelnetServer : IAsyncDisposable
         if (_trace) Log($"#{id} {line}");
     }
 
-    private async Task AcceptLoopAsync()
+    private async Task AcceptLoopAsync(TcpListener listener, bool tls)
     {
         while (!_stop.IsCancellationRequested)
         {
             TcpClient client;
             try
             {
-                client = await _listener.AcceptTcpClientAsync(_stop.Token);
+                client = await listener.AcceptTcpClientAsync(_stop.Token);
             }
             catch (Exception e) when (e is ObjectDisposedException or SocketException or OperationCanceledException)
             {
@@ -169,29 +191,36 @@ public sealed class TelnetServer : IAsyncDisposable
             lock (_gate)
             {
                 _clients.Add(client);
-                _tasks.Add(Task.Run(() => RunConnectionAsync(client, id)));
+                _tasks.Add(Task.Run(() => RunConnectionAsync(client, id, tls)));
             }
         }
     }
 
     // ---- one connection ----
 
-    private async Task RunConnectionAsync(TcpClient client, int id)
+    private async Task RunConnectionAsync(TcpClient client, int id, bool tls)
     {
-        string? device = null;
+        // The device name it holds, released however the session ends, a dropped connection included.
+        var device = new StrongBox<string?>();
         try
         {
-            Log($"#{id} connected");
-            device = await ServeAsync(client, id);
+            Log($"#{id} connected{(tls ? " (TLS)" : "")}");
+            if (!tls)
+            {
+                await ServeAsync(client.GetStream(), id, device);
+                return;
+            }
+            await using var secure = await Tls.AcceptAsync(client.GetStream(), _tls!.Certificate, $"#{id}", Log, _stop.Token);
+            if (secure is not null) await ServeAsync(secure, id, device);
         }
         catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException or OperationCanceledException)
         {
         }
         finally
         {
-            if (device is not null)
+            if (device.Value is { } held)
             {
-                lock (_gate) _devices.Remove(device);
+                lock (_gate) _devices.Remove(held);
             }
             lock (_gate) _clients.Remove(client);
             Close(client);
@@ -201,15 +230,14 @@ public sealed class TelnetServer : IAsyncDisposable
     }
 
     /// <summary>
-    /// Runs one session. Returns the device name still held when it ends, if any.
+    /// Runs one session, keeping the device name it takes in <paramref name="held"/>. Returns that name, if any.
     /// It negotiates as an IBM i does: one option at a time, asking for an option's value only once
     /// the client has agreed to the option (RFC 1091, 1572). NEW-ENVIRON first, then the terminal
     /// type, then end of record and binary both ways. A client that refuses NEW-ENVIRON still gets
     /// a session, on a device name made up for it.
     /// </summary>
-    private async Task<string?> ServeAsync(TcpClient client, int id)
+    private async Task<string?> ServeAsync(Stream stream, int id, StrongBox<string?> held)
     {
-        var stream = client.GetStream();
         var decoder = new TelnetDecoder();
         string? requested = null;
         var environment = false;
@@ -364,6 +392,7 @@ public sealed class TelnetServer : IAsyncDisposable
                     {
                         device = requested ?? NextDefaultDevice();
                         _devices.Add(device);
+                        held.Value = device;
                     }
                 }
                 if (collision is not null)

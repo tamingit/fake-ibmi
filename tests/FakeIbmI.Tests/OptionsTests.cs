@@ -19,8 +19,22 @@ public class OptionsTests
         Assert.Equal(new Options(23, null, IPAddress.Any, Trace: true),
             Options.Parse(["--trace", "--port", "23", "--bind", "0.0.0.0"]));
 
+    [Fact]
+    public void TlsPortsAndTheCertificateAreOptions() =>
+        Assert.Equal(new Options(2323, 8474, IPAddress.Loopback, SignonPort: 8476, TlsPort: 992, SignonTlsPort: 9476,
+                PrintTlsPort: 9474, TlsCert: "/certs/fake.pfx", TlsNames: "ibmi.example,10.0.0.5"),
+            Options.Parse(["--print-port", "8474", "--signon-port", "8476", "--tls-port", "992", "--signon-tls-port", "9476",
+                "--print-tls-port", "9474", "--tls-cert", "/certs/fake.pfx", "--tls-name", "ibmi.example", "--tls-name", "10.0.0.5"]));
+
+    [Theory]
+    [InlineData("--signon-tls-port")]
+    [InlineData("--print-tls-port")]
+    public void ATlsPortNeedsItsServer(string option) =>
+        Assert.Throws<ArgumentException>(() => Options.Parse([option, "9476"]));
+
     [Theory]
     [InlineData("--port", "x")]
+    [InlineData("--tls-port", "x")]
     [InlineData("--print-port", "x")]
     [InlineData("--signon-port", "x")]
     [InlineData("--mapper-port", "70000")]
