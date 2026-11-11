@@ -32,7 +32,7 @@ Password levels 0 and 1 use DES; 2 and 3 use SHA-1. The fake runs at level 2.
   - **Change password:** checks the old password, and the new one: it can't be empty, too long, or the same as the old one.
   - **Not supported:** profile tokens, Kerberos and multi-factor authentication.
 - **Remote command (port 8475):** runs CL commands and calls programs, as ACS does after signing on. It runs nothing: every command succeeds with no messages, and every program call succeeds. A few programs get real answers:
-  - `QSYCKUFU` (Check User Function Usage): every function is allowed for every user. ACS checks its functions this way.
+  - `QSYCKUFU` (Check User Function Usage): every function is allowed for every user (the API's `2`; `1` means not allowed). ACS checks its functions this way, such as `QIBM_XE1_5250` for the 5250 emulator.
   - `QWCRTVCA` (Retrieve Current Attributes): the server job's name.
   - **Any other program:** its output parameters come back filled with zeros. For an IBM API, zeros in the error code parameter mean success.
 

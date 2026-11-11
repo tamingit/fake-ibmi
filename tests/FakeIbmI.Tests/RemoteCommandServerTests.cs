@@ -120,7 +120,7 @@ public class RemoteCommandServerTests
         var reply = await client.CallAsync("QSYCKUFU", "QSYS",
             (1, 22, []), (30, 11, Ebcdic.Encode("QIBM_XE1_EXAMPLE".PadRight(30))), (10, 11, Ebcdic.Encode("PRTUSER   ")), (4, 11, []));
 
-        Assert.Equal([0xF1], Assert.Single(Parameters(reply)).Data); // EBCDIC '1': allowed
+        Assert.Equal([0xF2], Assert.Single(Parameters(reply)).Data); // EBCDIC '2': allowed ('1' is not allowed)
         lock (lines) Assert.Contains(lines, l => l.Contains("QSYS/QSYCKUFU") && l.Contains("QIBM_XE1_EXAMPLE allowed for PRTUSER"));
     }
 

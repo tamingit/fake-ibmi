@@ -213,9 +213,11 @@ public sealed class RemoteCommandServer : HostServer
                 byte[] receiver = [.. BigEndian(1), .. BigEndian(16 + data.Length), .. BigEndian(1009), 0xC3, 0, 0, 0, .. BigEndian(data.Length), .. data];
                 return (new() { [0] = receiver }, $"answered the job name {job[0]}/{job[1]}/{job[2]}");
             }
-            // Check User Function Usage: usage ('1' allowed, '2' denied), function ID (30), user (10), error code.
+            // Check User Function Usage: usage indicator, function ID (30), user (10), error code. The
+            // indicator is '1' when the user is NOT allowed to use the function and '2' when it is
+            // (IBM's API documentation); ACS refuses the feature on '1'.
             case "QSYS/QSYCKUFU" when parameters.Count >= 3 && parameters[0].Kind == ParameterKind.Output:
-                return (new() { [0] = [0xF1] }, $"answered {Text(1, 30)} allowed for {Text(2, 10)}");
+                return (new() { [0] = [0xF2] }, $"answered {Text(1, 30)} allowed for {Text(2, 10)}");
             default:
                 return ([], "answered success with zeros");
         }
