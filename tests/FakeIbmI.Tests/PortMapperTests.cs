@@ -33,6 +33,24 @@ public class PortMapperTests
     }
 
     [Theory]
+    [InlineData("as-signon\0")]
+    [InlineData("as-signon\r\n")]
+    [InlineData("as-signon ")]
+    public async Task ATerminatorAfterTheNameIsIgnored(string sent)
+    {
+        var lines = new List<string>();
+        await using var mapper = await PortMapper.StartAsync(0, new Dictionary<string, int> { ["as-signon"] = 8476 },
+            line => { lock (lines) lines.Add(line); });
+
+        var reply = await AskAsync(mapper.Port, sent);
+
+        Assert.Equal((byte)'+', reply[0]);
+        Assert.Equal(8476, BinaryPrimitives.ReadInt32BigEndian(reply.AsSpan(1)));
+        // The log shows what was sent, unprintable bytes in hex.
+        lock (lines) Assert.Contains(lines, l => l.Contains("as-signon\\x"));
+    }
+
+    [Theory]
     [InlineData("as-central")]
     [InlineData("as-signon-s")]
     public async Task AServiceItDoesNotRunGetsAMinus(string service)
