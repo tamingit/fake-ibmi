@@ -148,6 +148,8 @@ public abstract class HostServer : IAsyncDisposable
     /// start server (7002: the scheme byte, then 0x1104 user and 0x1105 substitute), as JTOpen
     /// opens every host server but sign-on. Returns the profile signed on, or null (logged) when
     /// it was refused with an IBM i's return code, or with <paramref name="refuse"/> when given.
+    /// When it signs on, the reply names the server job (0x111F: CCSID 37, then number/user/name),
+    /// as an IBM i's does; JTOpen asks for the job's name otherwise.
     /// </summary>
     protected async Task<UserProfile?> StartServerAsync(Stream stream, int id, ushort serverId, Users users, int? refuse = null)
     {
@@ -175,7 +177,9 @@ public abstract class HostServer : IAsyncDisposable
                      Passwords.Substitute(level, Passwords.Token(level, profile.User, profile.Password), profile.User, clientSeed, serverSeed, 1)))
             rc = 0x0003000B;
         else rc = profile.PasswordExpired ? 0x0003000D : 0;
-        await stream.WriteAsync(Frame(serverId, 0xF002, BigEndian(rc), CorrelationOf(start)), Stopping);
+        await stream.WriteAsync(rc == 0
+            ? Frame(serverId, 0xF002, BigEndian(0), CorrelationOf(start), 0, (0x111F, [.. BigEndian(37), .. Ebcdic.Encode(JobName(id))]))
+            : Frame(serverId, 0xF002, BigEndian(rc), CorrelationOf(start)), Stopping);
         if (rc != 0)
         {
             Log($"{LogName} #{id} sign-on refused ({rc:X8})");
@@ -184,6 +188,12 @@ public abstract class HostServer : IAsyncDisposable
         Log($"{LogName} #{id} signed on as {profile!.User}");
         return profile;
     }
+
+    /// <summary>The server job a connection runs in: an IBM i's host server job name for this server.</summary>
+    protected virtual string JobName(int id) => $"{JobNumber(id)}/QUSER/QZHQSSRV";
+
+    /// <summary>A six-digit job number for a connection.</summary>
+    protected static string JobNumber(int id) => $"{100000 + id % 900000}";
 
     private static void Require(byte[] frame, ushort serverId, ushort requestId)
     {

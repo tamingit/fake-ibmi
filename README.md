@@ -31,7 +31,12 @@ Password levels 0 and 1 use DES; 2 and 3 use SHA-1. The fake runs at level 2.
   - **Sign-on:** checks the user and password, and answers with the sign-on dates and the server's CCSID (37). It claims to be IBM i 7.5.
   - **Change password:** checks the old password, and the new one: it can't be empty, too long, or the same as the old one.
   - **Not supported:** profile tokens, Kerberos and multi-factor authentication.
-- **Remote command (port 8475):** runs CL commands and calls programs, as ACS does after signing on. It runs nothing: every command succeeds with no messages, and every program call succeeds with its output parameters filled with zeros. For an IBM API, zeros in the error code parameter mean success. The log names each command and program, with the program's parameter sizes, so it shows what a client asked for. It never logs a command's parameters or a program's data, which can hold passwords.
+- **Remote command (port 8475):** runs CL commands and calls programs, as ACS does after signing on. It runs nothing: every command succeeds with no messages, and every program call succeeds. A few programs get real answers:
+  - `QSYCKUFU` (Check User Function Usage): every function is allowed for every user. ACS checks its functions this way.
+  - `QWCRTVCA` (Retrieve Current Attributes): the server job's name.
+  - **Any other program:** its output parameters come back filled with zeros. For an IBM API, zeros in the error code parameter mean success.
+
+  The log names each command and program, with the program's parameter sizes and, for `QSYCKUFU`, the function checked. It never logs a command's parameters or other programs' data, which can hold passwords.
 - **Network Print (port 8474):** it lists placeholder spooled files and sends their contents.
 
 <a id="users"></a>**Users**

@@ -76,6 +76,8 @@ public sealed class NetworkPrintServer : HostServer
 
     protected override string LogName => "print";
 
+    protected override string JobName(int id) => $"{JobNumber(id)}/QUSER/QNPSERVS";
+
     protected override async Task ServeAsync(Stream stream, int id, bool tls)
     {
         if (!await SignOnAsync(stream, id)) return;

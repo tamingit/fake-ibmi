@@ -72,10 +72,56 @@ public class RemoteCommandServerTests
         Assert.Equal(100, outputs[0].Length);
         Assert.Empty(outputs[0].Data); // the client zero-fills up to the length
         Assert.Equal(8, outputs[1].Length);
-        Assert.Equal([0x11, 0x22], outputs[1].Data);
+        Assert.Equal([0x11, 0x22, 0, 0, 0, 0, 0, 0], outputs[1].Data);
         Assert.Equal(1024, outputs[2].Length);
         Assert.Equal(Enumerable.Repeat(new byte[] { 0x33, 0x40 }, 512).SelectMany(b => b), outputs[2].Data);
         Assert.Equal(["PGM QSYS/QLZAREQ"], server.Calls);
+    }
+
+    [Fact]
+    public async Task StartServerNamesTheServerJob()
+    {
+        await using var server = await RemoteCommandServer.StartAsync();
+        await using var client = await Client.ConnectAsync(server.Port);
+
+        var start = await client.StartReplyAsync("PRTUSER", "Secret12");
+
+        // 0x111F after the return code: CCSID 37, then number/user/name, as JTOpen splits it.
+        Assert.Equal(0x111F, BinaryPrimitives.ReadUInt16BigEndian(start.AsSpan(28)));
+        Assert.Equal(37, BinaryPrimitives.ReadInt32BigEndian(start.AsSpan(30)));
+        Assert.Matches("^[0-9]{6}/QUSER/QZRCSRVS$", Ebcdic.Decode(start.AsSpan(34)));
+    }
+
+    [Fact]
+    public async Task RetrieveCurrentAttributesAnswersTheJobName()
+    {
+        await using var server = await RemoteCommandServer.StartAsync();
+        await using var client = await Client.SignOnAsync(server.Port, "PRTUSER", "Secret12");
+
+        // As JTOpen's getJobInfo calls it: receiver (46), its length, RTVC0100, 1 attribute, key 1009, error code.
+        var reply = await client.CallAsync("QWCRTVCA", "QSYS",
+            (46, 22, []), (4, 11, [0, 0, 0, 46]), (8, 11, Ebcdic.Encode("RTVC0100")), (4, 11, [0, 0, 0, 1]),
+            (4, 11, [0, 0, 0x03, 0xF1]), (8, 11, []));
+
+        var receiver = Assert.Single(Parameters(reply)).Data;
+        Assert.Equal(46, receiver.Length);
+        Assert.Equal(1, BinaryPrimitives.ReadInt32BigEndian(receiver));
+        Assert.Equal(1009, BinaryPrimitives.ReadInt32BigEndian(receiver.AsSpan(8)));
+        Assert.Matches("^QZRCSRVS  QUSER     [0-9]{6}$", Ebcdic.Decode(receiver.AsSpan(20, 26)));
+    }
+
+    [Fact]
+    public async Task CheckUserFunctionUsageSaysAllowedAndLogsTheFunction()
+    {
+        var lines = new List<string>();
+        await using var server = await RemoteCommandServer.StartAsync(log: line => { lock (lines) lines.Add(line); });
+        await using var client = await Client.SignOnAsync(server.Port, "PRTUSER", "Secret12");
+
+        var reply = await client.CallAsync("QSYCKUFU", "QSYS",
+            (1, 22, []), (30, 11, Ebcdic.Encode("QIBM_XE1_EXAMPLE".PadRight(30))), (10, 11, Ebcdic.Encode("PRTUSER   ")), (4, 11, []));
+
+        Assert.Equal([0xF1], Assert.Single(Parameters(reply)).Data); // EBCDIC '1': allowed
+        lock (lines) Assert.Contains(lines, l => l.Contains("QSYS/QSYCKUFU") && l.Contains("QIBM_XE1_EXAMPLE allowed for PRTUSER"));
     }
 
     [Fact]
@@ -150,22 +196,24 @@ public class RemoteCommandServerTests
             return client;
         }
 
-        private static async Task<Client> ConnectAsync(int port)
+        public static async Task<Client> ConnectAsync(int port)
         {
             var tcp = new TcpClient();
             await tcp.ConnectAsync(IPAddress.Loopback, port);
             return new Client(tcp);
         }
 
-        private async Task<int> StartAsync(string user, string password)
+        private async Task<int> StartAsync(string user, string password) =>
+            BinaryPrimitives.ReadInt32BigEndian((await StartReplyAsync(user, password)).AsSpan(20));
+
+        public async Task<byte[]> StartReplyAsync(string user, string password)
         {
             var seeds = await RequestAsync(0x7001, ClientSeed);
             var level = seeds[5];
             var serverSeed = seeds.AsSpan(24, 8).ToArray();
             var substitute = Passwords.Substitute(level, Passwords.Token(level, user, password), user, ClientSeed, serverSeed, 1);
-            var start = await RequestAsync(0x7002, [level < 2 ? (byte)1 : (byte)3, 1, 0],
+            return await RequestAsync(0x7002, [level < 2 ? (byte)1 : (byte)3, 1, 0],
                 (0x1105, substitute), (0x1104, Ebcdic.Encode(user.PadRight(10))));
-            return BinaryPrimitives.ReadInt32BigEndian(start.AsSpan(20));
         }
 
         /// <summary>RCCallProgramRequestDataStream: program, library, message option, count, then each parameter.</summary>

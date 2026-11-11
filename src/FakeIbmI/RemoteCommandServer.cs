@@ -4,9 +4,10 @@
 //   1001 exchange attributes -> 8001: return code, CCSID 37, NLV 2924, version, data stream level
 //   1002 run command         -> 8002: return code 0, no messages
 //   1003 call program        -> 8003: return code 0, each output parameter zero-filled
-// It runs nothing. Every command and program succeeds, and a program's output is zeros, which an
-// IBM API reads as an empty error code: success with nothing returned. It logs each command's
-// name and each program's name and parameter sizes, but never a command's text or a
+// It runs nothing. Every command and program succeeds. A few programs get real answers (see
+// Answer): QWCRTVCA the job's name, QSYCKUFU "allowed". Any other program's output is zeros,
+// which an IBM API reads as an empty error code: success with nothing returned. It logs each
+// command's name and each program's name and parameter sizes, but never a command's text or a
 // parameter's contents, which can hold passwords.
 
 using System.Buffers.Binary;
@@ -76,6 +77,8 @@ public sealed class RemoteCommandServer : HostServer
 
     protected override string LogName => "rmtcmd";
 
+    protected override string JobName(int id) => $"{JobNumber(id)}/QUSER/QZRCSRVS";
+
     protected override async Task ServeAsync(Stream stream, int id, bool tls)
     {
         var profile = await StartServerAsync(stream, id, ServerId, Users);
@@ -130,8 +133,7 @@ public sealed class RemoteCommandServer : HostServer
         var library = Ebcdic.Decode(request.AsSpan(30, 10)).TrimEnd();
         var count = BinaryPrimitives.ReadUInt16BigEndian(request.AsSpan(41));
 
-        var outputs = new List<(int Id, byte[] Data)>();
-        var sizes = new List<string>();
+        var parameters = new List<Parameter>();
         var at = 43;
         for (var i = 0; i < count; i++)
         {
@@ -142,31 +144,88 @@ public sealed class RemoteCommandServer : HostServer
             var usage = BinaryPrimitives.ReadUInt16BigEndian(request.AsSpan(at + 10));
             var data = request.AsSpan(at + 12, length - 12);
             at += length;
-
-            switch (usage)
+            // Input comes with its trailing zeros left off, or compressed: back to its full length.
+            var input = usage is InputCompressed or InOutCompressed ? Rle.Decompress(data, maxLength) : Padded(data, maxLength);
+            var kind = usage switch
             {
-                case Output:
-                    sizes.Add($"out {maxLength}");
-                    if (maxLength > 0) outputs.Add((0x1103, OutputParameter(maxLength, 2, [])));
-                    break;
-                case InOut or InOutLevel5 or InOutCompressed:
-                    sizes.Add($"in-out {maxLength}");
-                    // In-out data comes back as it went (trailing zeros were left off it).
-                    var input = usage == InOutCompressed ? Rle.Decompress(data, maxLength) : data.ToArray();
-                    if (maxLength > 0) outputs.Add((0x1103, OutputParameter(maxLength, 3, input)));
-                    break;
-                case 0xFF:
-                    sizes.Add("null");
-                    break;
-                default:
-                    sizes.Add($"in {maxLength}{(usage == InputCompressed ? " (compressed)" : "")}");
-                    break;
-            }
+                Output => ParameterKind.Output,
+                InOut or InOutLevel5 or InOutCompressed => ParameterKind.InOut,
+                0xFF => ParameterKind.Null,
+                _ => ParameterKind.Input,
+            };
+            parameters.Add(new Parameter(kind, maxLength, kind == ParameterKind.Output ? [] : input));
         }
 
-        Record($"PGM {library}/{program}");
-        Log($"rmtcmd #{id} call {library}/{program} ({(sizes.Count == 0 ? "no parameters" : string.Join(", ", sizes))}): ran nothing, answered success");
+        var name = $"{library}/{program}";
+        var (answers, answered) = Answer(name, parameters, id);
+        var outputs = new List<(int Id, byte[] Data)>();
+        for (var i = 0; i < parameters.Count; i++)
+        {
+            var p = parameters[i];
+            if (p.Kind is not (ParameterKind.Output or ParameterKind.InOut) || p.MaxLength == 0) continue;
+            // In-out data comes back as it went unless the program answered it.
+            var data = answers.GetValueOrDefault(i) ?? (p.Kind == ParameterKind.InOut ? p.Input : []);
+            outputs.Add((0x1103, OutputParameter(p.MaxLength, p.Kind == ParameterKind.Output ? (ushort)2 : (ushort)3, data)));
+        }
+
+        Record($"PGM {name}");
+        var sizes = parameters.Select(p => p.Kind switch
+        {
+            ParameterKind.Output => $"out {p.MaxLength}",
+            ParameterKind.InOut => $"in-out {p.MaxLength}",
+            ParameterKind.Null => "null",
+            _ => $"in {p.MaxLength}",
+        }).ToList();
+        Log($"rmtcmd #{id} call {name} ({(sizes.Count == 0 ? "no parameters" : string.Join(", ", sizes))}): ran nothing, {answered}");
         return Frame(ServerId, 0x8003, [0, 0, 0, 0], correlation, 0, [.. outputs]);
+    }
+
+    private enum ParameterKind
+    {
+        Input,
+        Output,
+        InOut,
+        Null,
+    }
+
+    /// <summary>One program parameter: its usage, length, and the input it brought (full length).</summary>
+    private sealed record Parameter(ParameterKind Kind, int MaxLength, byte[] Input);
+
+    /// <summary>
+    /// The output a program gives, by parameter index (any other output is zeros), and what the log
+    /// says about it. Only these programs answer; their inputs are names, not secrets.
+    /// </summary>
+    private (Dictionary<int, byte[]> Outputs, string Answered) Answer(string program, List<Parameter> parameters, int id)
+    {
+        string Text(int index, int length) =>
+            index < parameters.Count ? Ebcdic.Decode(parameters[index].Input.AsSpan(0, Math.Min(length, parameters[index].Input.Length))).TrimEnd() : "";
+
+        switch (program)
+        {
+            // Retrieve Current Attributes, format RTVC0100: the number of attributes, then each as
+            // length, key, type ('C'), 3 reserved, data length, data. Key 1009 is the job's name:
+            // name (10), user (10), number (6). JTOpen asks for it when it doesn't know its server job.
+            case "QSYS/QWCRTVCA" when parameters.Count >= 5 && parameters[0].Kind == ParameterKind.Output
+                                      && BinaryPrimitives.ReadInt32BigEndian(Padded(parameters[4].Input, 4)) == 1009:
+            {
+                var job = JobName(id).Split('/');
+                byte[] data = [.. Ebcdic.Encode($"{job[2],-10}{job[1],-10}{job[0],-6}")];
+                byte[] receiver = [.. BigEndian(1), .. BigEndian(16 + data.Length), .. BigEndian(1009), 0xC3, 0, 0, 0, .. BigEndian(data.Length), .. data];
+                return (new() { [0] = receiver }, $"answered the job name {job[0]}/{job[1]}/{job[2]}");
+            }
+            // Check User Function Usage: usage ('1' allowed, '2' denied), function ID (30), user (10), error code.
+            case "QSYS/QSYCKUFU" when parameters.Count >= 3 && parameters[0].Kind == ParameterKind.Output:
+                return (new() { [0] = [0xF1] }, $"answered {Text(1, 30)} allowed for {Text(2, 10)}");
+            default:
+                return ([], "answered success with zeros");
+        }
+    }
+
+    private static byte[] Padded(ReadOnlySpan<byte> data, int length)
+    {
+        var result = new byte[Math.Max(length, data.Length)];
+        data.CopyTo(result);
+        return result;
     }
 
     /// <summary>An output parameter's code point data: its length, usage, then the data (the client zero-fills the rest).</summary>
