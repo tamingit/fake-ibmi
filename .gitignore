@@ -1,0 +1,12 @@
+# .NET build output
+bin/
+obj/
+TestResults/
+
+# editor and OS
+.idea/
+.vscode/*
+.DS_Store
+
+# Claude Code local files
+.claude/

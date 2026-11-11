@@ -1,0 +1,91 @@
+name: Release
+
+# A published GitHub release runs the tests, then builds the image and pushes it to GitHub's
+# container registry:
+#
+#   vX.Y.Z          →  ghcr.io/tamingit/fake-ibmi:X.Y.Z  and  :latest
+#   vX.Y.Z-<label>  →  ghcr.io/tamingit/fake-ibmi:X.Y.Z-<label>  (a pre-release; :latest stays)
+#
+# Any other tag is refused, and so is a release whose commit isn't on main.
+#
+#   gh release create v0.1.0 --target main --generate-notes
+#
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fake-ibmi-release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/tamingit/fake-ibmi
+
+jobs:
+  release:
+    name: Test, build and push
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read the tag, and check it is on main
+        id: tag
+        shell: bash
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "Tag '$TAG' is not vX.Y.Z or vX.Y.Z-<label>; refusing to build." >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag '$TAG' is on a commit that isn't on main; refusing to build." >&2
+            exit 1
+          fi
+          version="${TAG#v}"
+          tags="${IMAGE}:${version}"
+          [[ "$version" == *-* ]] || tags="${tags},${IMAGE}:latest"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Tests
+        run: dotnet test FakeIbmI.slnx
+
+      - name: Sign in to GitHub's registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          pull: true
+          push: true
+          tags: ${{ steps.tag.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=A scripted fake IBM i: 5250 Telnet and Network Print
+            org.opencontainers.image.version=${{ steps.tag.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}

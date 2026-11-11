@@ -1,0 +1,70 @@
+# Fake IBM i
+
+A scripted stand-in for an IBM i, for testing 5250 clients without a real system. It speaks TN5250E over Telnet and IBM's Network Print host server. Its screens are placeholders, and it keeps nothing.
+
+It was split out of [GreenGlow Connect](https://github.com/tamingit/greenglow), where it ran the server's and browser's tests and the public demo.
+
+**Status:** it serves the clients it was written for. The next goal is enough fidelity that IBM i Access Client Solutions (ACS) can connect to it and behave as it does with a real IBM i.
+
+## What it does
+
+**5250 display (Telnet, port 2323)**
+
+- **Negotiation:** TN5250E: terminal type, binary, end of record and NEW-ENVIRON.
+- **Device names:** it honours the device name a client asks for (`DEVNAME`). Without one, it makes one up. A name already in use gets the Startup Response Record's error code, as on a real system.
+- **Screens:**
+  - **Sign-on:** any user name signs on, and the password is ignored. A blank user gets "User required".
+  - **Main menu:**
+    - `4`: a list of placeholder items, three pages long, paged with Page Up and Page Down.
+    - `132`: a 27 × 132 screen.
+    - `90` or `signoff`: ends the session.
+    - F3: back to the sign-on screen.
+- **Logs:** it logs what clients do, but never the contents of a password field.
+
+**Network Print (host server, port 8474)**
+
+- **Sign-on:** user `PRTUSER`, password `Secret12`. Password levels 0 and 1 use DES; 2 and up use SHA-1.
+- **Spooled files:** it lists placeholder spooled files and sends their contents.
+
+## Running it
+
+Docker:
+
+```bash
+docker run --rm -p 127.0.0.1:2323:2323 -p 127.0.0.1:8474:8474 ghcr.io/tamingit/fake-ibmi
+```
+
+With the .NET 10 SDK:
+
+```bash
+dotnet run --project src/FakeIbmI -- --port 2323 --print-port 8474
+```
+
+- **Options:** `--port` (default 2323), `--print-port` (default: no Network Print server) and `--bind`.
+- **Listening address:** by default it listens on loopback only. The image passes `--bind 0.0.0.0` so it can be reached from outside the container. Publish it on `127.0.0.1`, as above, unless you mean other machines to reach it.
+
+## Tests
+
+```bash
+dotnet test FakeIbmI.slnx
+```
+
+- **Client:** the tests drive the fake with the 5250 client from GreenGlow Connect, copied into `tests/FakeIbmI.Tests/Client`.
+- **Limitation:** where the fake and that client share code (Telnet, EBCDIC), a mistake made on both sides can't be caught. Checking against other clients, such as ACS, is part of the fidelity work.
+
+GitHub Actions runs the tests and builds the image on every push.
+
+## Releases
+
+Publishing a GitHub release from main runs the tests, then pushes the image to GitHub's container registry:
+
+| Release tag | Image tags |
+|---|---|
+| `vX.Y.Z` | `ghcr.io/tamingit/fake-ibmi:X.Y.Z` and `:latest` |
+| `vX.Y.Z-<label>` (a pre-release) | `ghcr.io/tamingit/fake-ibmi:X.Y.Z-<label>` only |
+
+```bash
+gh release create v0.1.0 --target main --generate-notes
+```
+
+Other tags, and releases whose commit isn't on main, are refused.
