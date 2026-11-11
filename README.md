@@ -60,11 +60,12 @@ Publishing a GitHub release from main runs the tests, then pushes the image to G
 
 | Release tag | Image tags |
 |---|---|
+| `vX.Y.Z-beta` or `vX.Y.Z-beta.N` | `ghcr.io/tamingit/fake-ibmi:X.Y.Z-beta.N` and `:beta` |
 | `vX.Y.Z` | `ghcr.io/tamingit/fake-ibmi:X.Y.Z` and `:latest` |
-| `vX.Y.Z-<label>` (a pre-release) | `ghcr.io/tamingit/fake-ibmi:X.Y.Z-<label>` only |
 
 ```bash
-gh release create v0.1.0 --target main --generate-notes
+gh release create v0.1.0-beta.1 --target main --prerelease --generate-notes   # beta
+gh release create v0.1.0 --target main --generate-notes                       # stable
 ```
 
 Other tags, and releases whose commit isn't on main, are refused.

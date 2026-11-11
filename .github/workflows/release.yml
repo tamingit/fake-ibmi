@@ -3,12 +3,13 @@ name: Release
 # A published GitHub release runs the tests, then builds the image and pushes it to GitHub's
 # container registry:
 #
-#   vX.Y.Z          →  ghcr.io/tamingit/fake-ibmi:X.Y.Z  and  :latest
-#   vX.Y.Z-<label>  →  ghcr.io/tamingit/fake-ibmi:X.Y.Z-<label>  (a pre-release; :latest stays)
+#   vX.Y.Z-beta or vX.Y.Z-beta.N  →  ghcr.io/tamingit/fake-ibmi:X.Y.Z-beta.N  and  :beta
+#   vX.Y.Z                        →  ghcr.io/tamingit/fake-ibmi:X.Y.Z         and  :latest
 #
 # Any other tag is refused, and so is a release whose commit isn't on main.
 #
-#   gh release create v0.1.0 --target main --generate-notes
+#   gh release create v0.1.0-beta.1 --target main --prerelease --generate-notes   # beta
+#   gh release create v0.1.0 --target main --generate-notes                       # stable
 #
 on:
   release:
@@ -46,8 +47,8 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-            echo "Tag '$TAG' is not vX.Y.Z or vX.Y.Z-<label>; refusing to build." >&2
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta(\.[0-9]+)?)?$ ]]; then
+            echo "Tag '$TAG' is neither vX.Y.Z (stable) nor vX.Y.Z-beta[.N] (beta); refusing to build." >&2
             exit 1
           fi
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
@@ -55,8 +56,10 @@ jobs:
             exit 1
           fi
           version="${TAG#v}"
-          tags="${IMAGE}:${version}"
-          [[ "$version" == *-* ]] || tags="${tags},${IMAGE}:latest"
+          channel=latest
+          [[ "$TAG" == *-beta* ]] && channel=beta
+          tags="${IMAGE}:${version},${IMAGE}:${channel}"
+          echo "Building ${IMAGE}:${version} and :${channel}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
