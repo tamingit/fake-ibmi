@@ -287,6 +287,9 @@ public sealed record SpooledFile(
     /// <summary>Opening it answers with a CPF message instead.</summary>
     public bool Unauthorized { get; init; }
 
+    /// <summary>Who owns it: the user of the program that printed it. Placeholder files belong to the server's main user.</summary>
+    public string? User { get; init; }
+
     /// <summary>
     /// A two-page *SCS report 132 columns wide, an *AFPDS file (bytes that aren't SCS) and a
     /// *USERASCII PDF.
@@ -314,7 +317,7 @@ public sealed record SpooledFile(
         scs.Add(0x0C);
         var c = r.Created;
         return new SpooledFile(r.Name, (int)r.Id, "FAKEIBMI", ((int)(r.Id % 900000) + 100000).ToString(), "*SCS", r.Pages, "", "QPRINT",
-            $"{(c.Year - 1900) / 100}{c.Year % 100:00}{c.Month:00}{c.Day:00}", c.ToString("HHmmss"), [.. scs]);
+            $"{(c.Year - 1900) / 100}{c.Year % 100:00}{c.Month:00}{c.Day:00}", c.ToString("HHmmss"), [.. scs]) { User = r.User };
     }
 
     /// <summary>SCS: forms 132 by 66, a heading and lines on page one, a form feed, one line on page two.</summary>

@@ -35,6 +35,7 @@ Password levels 0 and 1 use DES; 2 and 3 use SHA-1. The fake runs at level 2.
   - **Not supported:** profile tokens, Kerberos and multi-factor authentication.
 - **Remote command (port 8475):** runs CL commands and calls programs, as ACS does after signing on. The [RPG commands](#rpg) (`CALL` of a program made from source, `CRTBNDRPG`, `RUNSQL` and so on) really run, and a program made from source is called with its parameters as bytes laid out as on an IBM i. A failed one answers return code `0400` (command) or `0500` (program) with no messages; the log says why. Anything else runs nothing: every other command succeeds with no messages, and so does every other program call. A few programs get real answers:
   - `QSYCKUFU` (Check User Function Usage): every function is allowed for every user (the API's `2`; `1` means not allowed). ACS checks its functions this way, such as `QIBM_XE1_5250` for the 5250 emulator.
+  - `QGYOLSPL`, `QGYGTLE` and `QGYCLST` (the open list of spooled files): ACS's Printer Output view lists spooled files this way, in format OSPL0300 or OSPL0400, and filters by user. It lists the placeholder files (owned by the main user) and what RPG programs printed (owned by the user who ran them).
   - `QWCRTVCA` (Retrieve Current Attributes): the server job's name.
   - **Any other program:** its output parameters come back filled with zeros. For an IBM API, zeros in the error code parameter mean success.
 

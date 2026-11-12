@@ -225,6 +225,46 @@ public class RemoteCommandServerTests
     }
 
     [Fact]
+    public async Task TheOpenListOfSpooledFilesListsThemForAUserAndClosesTheList()
+    {
+        await using var server = await RemoteCommandServer.StartAsync();
+        await using var client = await Client.SignOnAsync(server.Port, "PRTUSER", "Secret12");
+
+        // As JTOpen's SpooledFileOpenList sends QGYOLSPL for one user: OSPF0100 filter (92 bytes), job, format OSPL0300.
+        async Task<byte[]> OpenAsync(string user)
+        {
+            var filter = new byte[92];
+            Array.Fill(filter, (byte)0x40);
+            BinaryPrimitives.WriteInt32BigEndian(filter, 1);
+            Ebcdic.Encode(user.PadRight(10)).CopyTo(filter, 4);
+            var reply = await client.CallAsync("QGYOLSPL", "QSYS",
+                (0, 22, []), (4, 11, [0, 0, 0, 0]), (80, 22, []), (4, 11, [0xFF, 0xFF, 0xFF, 0xFF]), (4, 11, [0, 0, 0, 0]),
+                (92, 11, filter), (26, 11, Ebcdic.Encode("".PadRight(26))), (8, 11, Ebcdic.Encode("OSPL0300")), (8, 11, []));
+            return Parameters(reply).Single(p => p.Length == 80).Data;
+        }
+
+        var information = await OpenAsync("PRTUSER");
+        Assert.Equal(3, BinaryPrimitives.ReadInt32BigEndian(information));
+        Assert.Equal(136, BinaryPrimitives.ReadInt32BigEndian(information.AsSpan(12)));
+        Assert.Equal(0xF2, information[30]); // ready
+        var handle = information[8..12];
+
+        // QGYGTLE: the first two, as the receiver, its length, the handle, list information, number, starting record.
+        var got = await client.CallAsync("QGYGTLE", "QSYS",
+            (272, 22, []), (4, 11, [0, 0, 0x01, 0x10]), (4, 11, handle), (80, 22, []), (4, 11, [0, 0, 0, 2]), (4, 11, [0, 0, 0, 1]), (8, 11, []));
+        var outputs = Parameters(got);
+        var receiver = outputs[0].Data;
+        Assert.Equal(2, BinaryPrimitives.ReadInt32BigEndian(outputs[1].Data.AsSpan(4)));
+        Assert.Equal("QSYSPRT   ", Ebcdic.Decode(receiver.AsSpan(26, 10)));
+        Assert.Equal("QPADEV0001PRTUSER   123456", Ebcdic.Decode(receiver.AsSpan(0, 26)));
+        Assert.Equal(2, BinaryPrimitives.ReadInt32BigEndian(receiver.AsSpan(120)));
+        Assert.Equal("QPRTAFP   ", Ebcdic.Decode(receiver.AsSpan(136 + 26, 10)));
+
+        await client.CallAsync("QGYCLST", "QSYS", (4, 11, handle), (8, 11, []));
+        Assert.Equal(0, BinaryPrimitives.ReadInt32BigEndian(await OpenAsync("NOBODY")));
+    }
+
+    [Fact]
     public async Task ADisabledUserIsRefusedAtStartServer()
     {
         await using var server = await RemoteCommandServer.StartAsync();

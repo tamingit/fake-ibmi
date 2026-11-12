@@ -6,7 +6,7 @@
 //   1003 call program        -> 8003: return code 0, each output parameter zero-filled
 // The machine's own commands (CALL of a program it has, CRTBNDRPG, RUNSQL and so on) and programs
 // created from source run for real. Anything else runs nothing and succeeds. A few IBM programs
-// get real answers (see Answer): QWCRTVCA the job's name, QSYCKUFU "allowed". Any other program's
+// get real answers (see Answer): QWCRTVCA the job's name, QSYCKUFU "allowed", and the spooled file open list (QGYOLSPL, QGYGTLE, QGYCLST). Any other program's
 // output is zeros, which an IBM API reads as an empty error code: success with nothing returned. It logs each
 // command's name and each program's name and parameter sizes, but never a command's text or a
 // parameter's contents, which can hold passwords.
@@ -37,6 +37,7 @@ public sealed class RemoteCommandServer : HostServer
     private const int InputCompressed = 21;
 
     private readonly List<string> _calls = [];
+    private readonly SpoolOpenList _spoolLists;
     private int _signOns;
     private int _refusals;
 
@@ -45,6 +46,7 @@ public sealed class RemoteCommandServer : HostServer
     {
         Users = users ?? Users.Defaults();
         Machine = machine ?? Machine.Open();
+        _spoolLists = new SpoolOpenList(() => [.. SpooledFile.Defaults(), .. Machine.Store.Spools().Select(SpooledFile.From)], () => Users.Main.User);
     }
 
     /// <summary>
@@ -320,6 +322,26 @@ public sealed class RemoteCommandServer : HostServer
             // (IBM's API documentation); ACS refuses the feature on '1'.
             case "QSYS/QSYCKUFU" when parameters.Count >= 3 && parameters[0].Kind == ParameterKind.Output:
                 return (new() { [0] = [0xF2] }, $"answered {Text(1, 30)} allowed for {Text(2, 10)}");
+            // The open list of spooled files, as JTOpen's SpooledFileOpenList (ACS's printer output) asks: build
+            // it (the list information comes back in parameter 2), get entries from it, close it.
+            case "QSYS/QGYOLSPL" when parameters.Count >= 8:
+            {
+                var information = _spoolLists.Open(parameters[5].Input, parameters[7].Input.AsSpan(0, Math.Min(8, parameters[7].Input.Length)).ToArray());
+                return information is null
+                    ? ([], $"didn't list spooled files: format {Text(7, 8)} isn't supported")
+                    : (new() { [2] = information }, $"listed {BinaryPrimitives.ReadInt32BigEndian(information)} spooled files");
+            }
+            case "QSYS/QGYGTLE" when parameters.Count >= 6 && parameters[2].Input.Length >= 4:
+            {
+                var got = _spoolLists.Get(parameters[2].Input, parameters[0].MaxLength, BinaryPrimitives.ReadInt32BigEndian(Padded(parameters[4].Input, 4)),
+                    BinaryPrimitives.ReadInt32BigEndian(Padded(parameters[5].Input, 4)));
+                return got is null
+                    ? ([], "answered zeros: no such list")
+                    : (new() { [0] = got.Value.Receiver, [3] = got.Value.Information }, $"returned {BinaryPrimitives.ReadInt32BigEndian(got.Value.Information.AsSpan(4))} entries");
+            }
+            case "QSYS/QGYCLST" when parameters.Count >= 1 && parameters[0].Input.Length >= 4:
+                _spoolLists.Close(parameters[0].Input);
+                return ([], "closed the list");
             default:
                 return ([], "answered success with zeros");
         }
