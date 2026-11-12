@@ -1,0 +1,95 @@
+     A* User maintenance: a list of the users in QFAKE_USER, with create, change and delete.
+     A                                      DSPSIZ(24 80 *DS3)
+     A                                      CA03(03 'Exit')
+     A                                      CA06(06 'Create')
+     A                                      CA12(12 'Cancel')
+     A          R ROW                       SFL
+     A            OPT            1A  B  7  3
+     A            UNAME         10A  O  7  7
+     A            USTATUS        9A  O  7 19
+     A            UPWDEXP        4A  O  7 29
+     A            UTEXT         30A  O  7 38
+     A          R LIST                      SFLCTL(ROW)
+     A                                      SFLSIZ(200) SFLPAG(12)
+     A                                      OVERLAY
+     A  40                                  SFLDSP
+     A                                      SFLDSPCTL
+     A N40                                  SFLCLR
+     A  40                                  SFLEND(*MORE)
+     A                                  1 34'Work with Users'
+     A                                      DSPATR(HI)
+     A                                  4  2'Type options, press Enter.'
+     A                                  5  2'2=Change   4=Delete'
+     A                                  6  2'Opt  User        Status    Expired  Description'
+     A                                      DSPATR(HI)
+     A          R KEYS
+     A                                 23  2'F3=Exit   F6=Create   F12=Cancel'
+     A            MSG           60A  O 21  2DSPATR(HI)
+     A          R NEWUSER
+     A                                  1 33'Create User'
+     A                                      DSPATR(HI)
+     A                                  4  2'User  . . . . . . . .'
+     A            UNAME         10A  B  4 25
+     A  50                                  ERRMSG('A user name is 1 to 10 +
+     A                                      letters, digits, # $ @ or _, not +
+     A                                      starting with a digit' 50)
+     A  51                                  ERRMSG('That user already exists' +
+     A                                      51)
+     A                                  5  2'Password  . . . . . .'
+     A            UPWD          27A  B  5 25DSPATR(ND)
+     A                                      CHECK(LC)
+     A  52                                  ERRMSG('A password is required' 52)
+     A                                  6  2'Confirm password  . .'
+     A            UPWD2         27A  B  6 25DSPATR(ND)
+     A                                      CHECK(LC)
+     A  53                                  ERRMSG('The passwords are not the +
+     A                                      same' 53)
+     A                                  7  2'Status  . . . . . . .'
+     A            USTATUS        9A  B  7 25
+     A  54                                  ERRMSG('Status must be *ENABLED +
+     A                                      or *DISABLED' 54)
+     A                                  7 36'*ENABLED, *DISABLED'
+     A                                  8  2'Password expired  . .'
+     A            UPWDEXP        4A  B  8 25
+     A  55                                  ERRMSG('Password expired must be +
+     A                                      *YES or *NO' 55)
+     A                                  8 36'*YES, *NO'
+     A                                  9  2'Description . . . . .'
+     A            UTEXT         30A  B  9 25CHECK(LC)
+     A                                 23  2'Enter=Save   F12=Cancel'
+     A          R CHGUSER
+     A                                  1 31'Change User'
+     A                                      DSPATR(HI)
+     A                                  4  2'User  . . . . . . . .'
+     A            UNAME         10A  O  4 25
+     A                                  5  2'Password  . . . . . .'
+     A            UPWD          27A  B  5 25DSPATR(ND)
+     A                                      CHECK(LC)
+     A                                  6  2'Confirm password  . .'
+     A            UPWD2         27A  B  6 25DSPATR(ND)
+     A                                      CHECK(LC)
+     A  53                                  ERRMSG('The passwords are not the +
+     A                                      same' 53)
+     A                                  7  2'Status  . . . . . . .'
+     A            USTATUS        9A  B  7 25
+     A  54                                  ERRMSG('Status must be *ENABLED +
+     A                                      or *DISABLED' 54)
+     A                                  7 36'*ENABLED, *DISABLED'
+     A                                  8  2'Password expired  . .'
+     A            UPWDEXP        4A  B  8 25
+     A  55                                  ERRMSG('Password expired must be +
+     A                                      *YES or *NO' 55)
+     A                                  8 36'*YES, *NO'
+     A                                  9  2'Description . . . . .'
+     A            UTEXT         30A  B  9 25CHECK(LC)
+     A                                 11  2'Leave the password blank to keep it.'
+     A                                 23  2'Enter=Save   F12=Cancel'
+     A          R CONFIRM
+     A                                  1 32'Delete User'
+     A                                      DSPATR(HI)
+     A                                  4  2'User  . . . . .'
+     A            UNAME         10A  O  4 20
+     A                                  5  2'Description . .'
+     A            UTEXT         30A  O  5 20
+     A                                  8  2'Press Enter to delete this user.'
+     A                                 23  2'Enter=Delete   F12=Cancel'

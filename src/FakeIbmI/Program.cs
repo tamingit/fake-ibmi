@@ -28,7 +28,12 @@ void Log(string line) => Console.WriteLine(line);
 
 try
 {
-    var options = Options.Parse(args);
+    // The settings come first, as they give the options what the command line doesn't.
+    var envFile = Options.EnvFileIn(args) ?? (File.Exists(".env") ? ".env" : null);
+    if (Options.EnvFileIn(args) is { } named && !File.Exists(named))
+        throw new ArgumentException($"--env-file {named} doesn't exist");
+    var settings = Settings.Load(envFile, Environment.GetEnvironmentVariables());
+    var options = Options.Parse(args, settings);
     if (options.SourceDir is not null && !Directory.Exists(options.SourceDir))
         throw new ArgumentException($"--source-dir {options.SourceDir} doesn't exist");
     if (options.Check)
@@ -38,15 +43,12 @@ try
         Console.WriteLine(unsupported == 0 ? "source: everything is supported" : $"source: {unsupported} line{(unsupported == 1 ? "" : "s")} not supported");
         return unsupported == 0 ? 0 : 3;
     }
-    var envFile = options.EnvFile ?? (File.Exists(".env") ? ".env" : null);
-    if (options.EnvFile is not null && !File.Exists(options.EnvFile))
-        throw new ArgumentException($"--env-file {options.EnvFile} doesn't exist");
-    // Every server checks sign-ons against the same users, so a password changed through one holds for all.
-    var users = Users.FromSettings(Settings.Load(envFile, Environment.GetEnvironmentVariables()));
-    Console.WriteLine($"users{(envFile is null ? "" : $" (settings from {envFile})")}: {string.Join(", ", users.All)}");
     // Every server works on the same source, programs and tables.
     using var machine = Machine.Open(options.Database);
     Console.WriteLine($"database: {options.Database ?? "in memory (--database keeps it in a file)"}");
+    // Every server checks sign-ons against the same users, kept in the database, so a password changed through one holds for all.
+    var users = Users.Open(machine.Store, settings);
+    Console.WriteLine($"users{(envFile is null ? "" : $" (settings from {envFile})")}: {string.Join(", ", users.All)}");
     if (options.SourceDir is not null) machine.Import(options.SourceDir, Log);
     var certificate = options.AnyTls
         ? Tls.LoadOrCreate(options.TlsCert, Tls.Names(options.Bind, options.ExtraTlsNames), Log)

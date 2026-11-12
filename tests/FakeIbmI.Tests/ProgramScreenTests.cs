@@ -386,6 +386,58 @@ public class ProgramScreenTests
     }
 
     [Fact]
+    public async Task TheUserAppCreatesChangesAndDeletesUsersTheServersSignOn()
+    {
+        using var machine = Machine.Open();
+        var lines = new List<string>();
+        Assert.Equal(0, machine.Import(Path.Combine(Examples(), "..", "users"), lines.Add));
+        Assert.DoesNotContain(lines, l => l.Contains("warning") || l.Contains("not supported"));
+        var users = Users.Open(machine.Store, new Dictionary<string, string>());
+        await using var host = await TelnetServer.StartAsync(users: users, machine: machine);
+        await using var client = await SignOnAsync(host);
+        await CommandAsync(client, "call usrmnt");
+        await client.WaitForTextAsync("Work with Users");
+        Assert.Contains("PRTUSER", client.Text());
+        Assert.Contains("*DISABLED", client.Text());
+
+        // F6: a new user needs a valid name and the same password twice.
+        await client.PressAsync(new FunctionKey("F6"));
+        await client.WaitForTextAsync("Create User");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("A user name is 1 to 10");
+        await TypeAtAsync(client, 4, 25, "ada");
+        await TypeAtAsync(client, 5, 25, "Pass1");
+        await TypeAtAsync(client, 6, 25, "Pass2");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("The passwords are not the same");
+        await TypeAtAsync(client, 6, 25, "Pass1");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("User ADA created.");
+        Assert.Equal(SignOnResult.SignedOn, users.Check("ada", "Pass1").Result);
+
+        // 2 beside ADA (the first, by name): disable it. A blank password keeps the old one.
+        await TypeAtAsync(client, 7, 3, "2");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("Change User");
+        await TypeAtAsync(client, 7, 25, "*DISABLED");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("User ADA changed.");
+        Assert.Equal(SignOnResult.Disabled, users.Check("ADA", "Pass1").Result);
+        Assert.Equal("Pass1", users.Find("ADA")!.Password);
+
+        // 4 beside ADA: delete it.
+        await TypeAtAsync(client, 7, 3, "4");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("Delete User");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("User ADA deleted.");
+        Assert.Equal(SignOnResult.UnknownUser, users.Check("ADA", "Pass1").Result);
+
+        await client.PressAsync(new FunctionKey("F3"));
+        await client.WaitForTextAsync("IBM i Main Menu");
+    }
+
+    [Fact]
     public async Task TheCustomerAppListsSearchesLooksUpAndCreates()
     {
         using var machine = Machine.Open();

@@ -64,4 +64,42 @@ public class OptionsTests
         await client.ConnectAsync(IPAddress.Loopback, host.Port);
         Assert.True(client.Connected);
     }
+
+    [Fact]
+    public void SettingsGivePortsAndTheAddressAndTheCommandLineWins()
+    {
+        var settings = new Dictionary<string, string>
+        {
+            ["FAKE_IBMI_BIND"] = "0.0.0.0", ["FAKE_IBMI_PORT"] = "2324", ["FAKE_IBMI_PRINT_PORT"] = "8474",
+            ["FAKE_IBMI_SIGNON_PORT"] = "8476", ["FAKE_IBMI_COMMAND_PORT"] = "8475", ["FAKE_IBMI_MAPPER_PORT"] = "",
+            ["FAKE_IBMI_TLS_PORT"] = "992", ["FAKE_IBMI_PRINT_TLS_PORT"] = "9474", ["FAKE_IBMI_SIGNON_TLS_PORT"] = "9476",
+            ["FAKE_IBMI_COMMAND_TLS_PORT"] = "9475", ["FAKE_IBMI_TLS_CERT"] = "fake.pfx", ["FAKE_IBMI_TLS_NAMES"] = "ibmi.example",
+        };
+
+        Assert.Equal(new Options(2324, 8474, IPAddress.Any, SignonPort: 8476, CommandPort: 8475, TlsPort: 992, PrintTlsPort: 9474,
+                SignonTlsPort: 9476, CommandTlsPort: 9475, TlsCert: "fake.pfx", TlsNames: "ibmi.example"),
+            Options.Parse([], settings));
+        var overridden = Options.Parse(["--port", "23", "--bind", "127.0.0.1"], settings);
+        Assert.Equal((23, IPAddress.Loopback, 8474), (overridden.Port, overridden.Bind, overridden.PrintPort));
+        Assert.Throws<ArgumentException>(() => Options.Parse([], new Dictionary<string, string> { ["FAKE_IBMI_PORT"] = "http" }));
+        Assert.Throws<ArgumentException>(() => Options.Parse([], new Dictionary<string, string> { ["FAKE_IBMI_BIND"] = "localhost" }));
+        Assert.Equal("x.env", Options.EnvFileIn(["--trace", "--env-file", "x.env"]));
+        Assert.Null(Options.EnvFileIn(["--trace"]));
+    }
+
+    [Fact]
+    public void EnvExampleListsEveryPortAndAddressSetting()
+    {
+        var folder = new DirectoryInfo(AppContext.BaseDirectory);
+        while (folder is not null && !File.Exists(Path.Combine(folder.FullName, ".env.example"))) folder = folder.Parent;
+        var example = Settings.Parse(File.ReadLines(Path.Combine(folder!.FullName, ".env.example")));
+
+        Assert.All(Options.Variables.Where(v => v is not ("FAKE_IBMI_TLS_CERT" or "FAKE_IBMI_TLS_NAMES")), v => Assert.Contains(v, example.Keys));
+        // As it is, it starts every server on IBM's ports, with TLS on each, but for the two below 1024 (they need root).
+        var options = Options.Parse([], example);
+        Assert.Equal((2323, 8474, 8476, 8475), (options.Port, options.PrintPort, options.SignonPort, options.CommandPort));
+        Assert.Equal((9474, 9476, 9475), (options.PrintTlsPort, options.SignonTlsPort, options.CommandTlsPort));
+        Assert.Null(options.MapperPort);
+        Assert.Null(options.TlsPort);
+    }
 }

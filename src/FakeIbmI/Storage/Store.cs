@@ -31,6 +31,9 @@ public sealed record Member(string Library, string File, string Name, string Typ
 /// <summary>A spooled file a program printed: its lines, as text.</summary>
 public sealed record SpoolRecord(long Id, string Name, string User, int Pages, int Width, DateTime Created, string Text);
 
+/// <summary>One user profile as the table QFAKE_USER keeps it. Status is *ENABLED or *DISABLED, PasswordExpired *YES or *NO.</summary>
+public sealed record UserRow(string User, string Password, string Status, string PasswordExpired, string Text);
+
 /// <summary>An object made from a member: type *PGM or *FILE, with the source it was made from.</summary>
 public sealed record StoredObject(string Library, string Name, string Type, string Attribute, string Source, long Version);
 
@@ -68,6 +71,9 @@ public sealed class Store : IDisposable
             CREATE TABLE IF NOT EXISTS QFAKE_SPOOL (
                 ID INTEGER PRIMARY KEY AUTOINCREMENT, NAME TEXT NOT NULL, USER TEXT NOT NULL, PAGES INTEGER NOT NULL,
                 WIDTH INTEGER NOT NULL, CREATED TEXT NOT NULL, TEXT TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS QFAKE_USER (
+                USERNAME TEXT NOT NULL PRIMARY KEY, PASSWORD TEXT NOT NULL, STATUS TEXT NOT NULL DEFAULT '*ENABLED',
+                PWDEXP TEXT NOT NULL DEFAULT '*NO', TEXT TEXT NOT NULL DEFAULT '');
             CREATE TABLE IF NOT EXISTS SYSDUMMY1 (IBMREQD TEXT NOT NULL);
             INSERT INTO SYSDUMMY1 SELECT 'Y' WHERE NOT EXISTS (SELECT 1 FROM SYSDUMMY1);
             """);
@@ -186,6 +192,27 @@ public sealed class Store : IDisposable
     }
 
     // ---- spooled files ----
+
+    // ---- users ----
+
+    private static UserRow ReadUser(SqliteDataReader r) => new(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4));
+
+    /// <summary>Every user profile, by name.</summary>
+    public IReadOnlyList<UserRow> UserRows() =>
+        Query("SELECT USERNAME, PASSWORD, STATUS, PWDEXP, TEXT FROM QFAKE_USER ORDER BY USERNAME", ReadUser);
+
+    public UserRow? FindUser(string name) =>
+        Query("SELECT USERNAME, PASSWORD, STATUS, PWDEXP, TEXT FROM QFAKE_USER WHERE USERNAME = @n", ReadUser, ("@n", name)).FirstOrDefault();
+
+    /// <summary>Adds the user, or replaces the one of that name.</summary>
+    public void SaveUser(UserRow user) =>
+        Run("INSERT OR REPLACE INTO QFAKE_USER VALUES (@u, @p, @s, @e, @t)",
+            ("@u", user.User), ("@p", user.Password), ("@s", user.Status), ("@e", user.PasswordExpired), ("@t", user.Text));
+
+    /// <summary>Keeps a user's password and flags, as signing on changes them, leaving its text.</summary>
+    public void UpdateUser(string name, string password, bool disabled, bool passwordExpired) =>
+        Run("UPDATE QFAKE_USER SET PASSWORD = @p, STATUS = @s, PWDEXP = @e WHERE USERNAME = @u",
+            ("@u", name), ("@p", password), ("@s", disabled ? "*DISABLED" : "*ENABLED"), ("@e", passwordExpired ? "*YES" : "*NO"));
 
     /// <summary>Keeps the printed lines as a new spooled file, 60 lines to a page. Returns its number.</summary>
     public long AddSpool(string name, string user, int width, IReadOnlyList<string> lines)

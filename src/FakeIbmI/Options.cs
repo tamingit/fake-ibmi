@@ -13,7 +13,8 @@ namespace FakeIbmI;
 /// names the file of settings, such as the users (default: .env, when there is one). --database
 /// names the SQLite file for source, programs and tables (default: in memory), --source-dir a
 /// folder of source to read at start-up, and --check reads that folder, reports what isn't
-/// supported and stops.
+/// supported and stops. Settings (FAKE_IBMI_PORT, FAKE_IBMI_BIND and the rest, see .env.example) give
+/// what the command line doesn't: the command line wins.
 /// </summary>
 public sealed record Options(
     int Port, int? PrintPort, IPAddress Bind, bool Trace = false, int? SignonPort = null, int? MapperPort = null,
@@ -24,9 +25,41 @@ public sealed record Options(
     /// <summary>Whether any server listens for TLS, and so needs a certificate.</summary>
     public bool AnyTls => TlsPort is not null || SignonTlsPort is not null || PrintTlsPort is not null || CommandTlsPort is not null;
 
-    public static Options Parse(IReadOnlyList<string> args)
+    /// <summary>The environment variables that set the ports, the address and the certificate, as .env.example lists them.</summary>
+    public static readonly string[] Variables =
+    [
+        "FAKE_IBMI_BIND", "FAKE_IBMI_PORT", "FAKE_IBMI_PRINT_PORT", "FAKE_IBMI_SIGNON_PORT", "FAKE_IBMI_COMMAND_PORT",
+        "FAKE_IBMI_MAPPER_PORT", "FAKE_IBMI_TLS_PORT", "FAKE_IBMI_PRINT_TLS_PORT", "FAKE_IBMI_SIGNON_TLS_PORT",
+        "FAKE_IBMI_COMMAND_TLS_PORT", "FAKE_IBMI_TLS_CERT", "FAKE_IBMI_TLS_NAMES",
+    ];
+
+    /// <summary>The file --env-file names, which has to be known before the settings in it can be read.</summary>
+    public static string? EnvFileIn(IReadOnlyList<string> args)
     {
-        var options = new Options(2323, null, IPAddress.Loopback);
+        var at = args.ToList().LastIndexOf("--env-file");
+        return at >= 0 && at + 1 < args.Count ? args[at + 1] : null;
+    }
+
+    /// <summary>
+    /// The options from the command line. <paramref name="settings"/> (see <see cref="Variables"/>) give what
+    /// the command line doesn't: a blank setting is no setting, and a server with no port doesn't run.
+    /// </summary>
+    public static Options Parse(IReadOnlyList<string> args, IReadOnlyDictionary<string, string>? settings = null)
+    {
+        string? Setting(string name) =>
+            settings is not null && settings.TryGetValue(name, out var v) && !string.IsNullOrWhiteSpace(v) ? v.Trim() : null;
+        int? SettingPort(string name) => Setting(name) is { } v
+            ? int.TryParse(v, out var p) && p is >= 0 and <= 65535 ? p : throw new ArgumentException($"{name} {v} is not a port")
+            : null;
+        var options = new Options(SettingPort("FAKE_IBMI_PORT") ?? 2323, SettingPort("FAKE_IBMI_PRINT_PORT"),
+            Setting("FAKE_IBMI_BIND") is { } bind
+                ? IPAddress.TryParse(bind, out var bindAddress) ? bindAddress : throw new ArgumentException($"FAKE_IBMI_BIND {bind} is not an IP address")
+                : IPAddress.Loopback,
+            SignonPort: SettingPort("FAKE_IBMI_SIGNON_PORT"), MapperPort: SettingPort("FAKE_IBMI_MAPPER_PORT"),
+            TlsPort: SettingPort("FAKE_IBMI_TLS_PORT"), SignonTlsPort: SettingPort("FAKE_IBMI_SIGNON_TLS_PORT"),
+            PrintTlsPort: SettingPort("FAKE_IBMI_PRINT_TLS_PORT"), TlsCert: Setting("FAKE_IBMI_TLS_CERT"),
+            TlsNames: Setting("FAKE_IBMI_TLS_NAMES"), CommandPort: SettingPort("FAKE_IBMI_COMMAND_PORT"),
+            CommandTlsPort: SettingPort("FAKE_IBMI_COMMAND_TLS_PORT"));
         for (var i = 0; i < args.Count; i++)
         {
             if (args[i] == "--trace")

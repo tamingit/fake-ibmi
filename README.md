@@ -59,7 +59,7 @@ The fake runs free-form RPG IV against a SQLite database. Source members, the pr
 
 *Printing:* `dcl-f name printer(width);` and `write name line;` collect lines, and when the program ends they become one spooled file named for the printer file, which the Network Print server lists and serves.
 
-The examples are in `examples/`: `source` (a hello program and a customer list) and `customers`, a customer maintenance program with a 50-customer table, a list with search, lookup, create and print.
+The examples are in `examples/`: `source` (a hello program and a customer list), `customers` (a customer maintenance program with a 50-customer table, a list with search, lookup, create and print) and `users` (user maintenance, see [Users](#users)).
 
 ```bash
 dotnet run --project src/FakeIbmI -- --source-dir examples/customers --print-port 8474
@@ -68,7 +68,7 @@ dotnet run --project src/FakeIbmI -- --source-dir examples/customers --print-por
 
 <a id="users"></a>**Users**
 
-Every server checks sign-ons against the same three users: the 5250 sign-on screen, the sign-on server and Network Print. A password changed through any of them holds for all of them, until the fake stops.
+Every server checks sign-ons against the same users: the 5250 sign-on screen, the sign-on server, Network Print and the remote command server. They're kept in the SQLite database, in the table `QFAKE_USER` (`USERNAME`, `PASSWORD`, `STATUS` `*ENABLED` or `*DISABLED`, `PWDEXP` `*YES` or `*NO`, `TEXT`), so there can be as many as you like, and they're kept with `--database`. A password changed through any server holds for all of them. These three are there to begin with:
 
 | User | Password | Signing on with the right password |
 |---|---|---|
@@ -76,6 +76,8 @@ Every server checks sign-ons against the same three users: the 5250 sign-on scre
 | `EXPUSER` | `Expired1` | The password has expired. The 5250 screen goes on to Change Password; the sign-on server answers `0003000D` until the password is changed through it. |
 | `LOCKUSER` | `Locked12` | The profile is disabled, so it can't sign on with any password. The 5250 screen says "User profile LOCKUSER cannot sign on."; the host servers answer `00020002`. |
 
+- **Adding more:** run the user maintenance program, `examples/users`: load it with `--source-dir examples/users` and enter `CALL USRMNT` on the 5250 command line. F6 creates a user, 2 changes one (a blank password keeps the old one) and 4 deletes one. A change holds at the next sign-on. Any SQL on `QFAKE_USER` does the same. Passwords are kept as typed, so every server can check them: use placeholders.
+- **The three above:** their names and passwords come from `.env` and are put in the table at each start, as written there, so a change to one of them in the table lasts until the next start. Every other user is left alone.
 - **Setting them:** copy `.env.example` to `.env` and change the names and passwords. The fake reads `.env` from the directory it starts in, or the file `--env-file` names. Variables set in the environment win over the file. For Docker, pass the file with `--env-file .env`, or leave that out to use the defaults.
 - **Values:** write them without quotes, as Docker keeps quotes as part of the value. A user name is up to 10 characters. A password can be up to 27 characters on the 5250 sign-on screen, and up to 128 for the host servers.
 - **Logs:** the fake logs who signed on and why a sign-on was refused, but never a password.
@@ -125,6 +127,7 @@ Port 449 is below 1024, so outside a container the fake needs root, or `CAP_NET_
   - `--source-dir`: a folder of source to read at start-up (see [RPG](#rpg)).
   - `--check`: with `--source-dir`, only check the source, report what isn't supported and exit (code 3 when something isn't).
   - `--env-file`: the file of settings, such as the [users](#users) (default: `.env`, when there is one).
+  - **Settings:** `.env` also sets the address and every port: `FAKE_IBMI_BIND`, `FAKE_IBMI_PORT`, `FAKE_IBMI_PRINT_PORT`, `FAKE_IBMI_SIGNON_PORT`, `FAKE_IBMI_COMMAND_PORT`, `FAKE_IBMI_MAPPER_PORT`, the four `FAKE_IBMI_*_TLS_PORT`s, `FAKE_IBMI_TLS_CERT` and `FAKE_IBMI_TLS_NAMES`. The options above win over them, and a blank port leaves that server off. The image sets its own address and ports, so they don't apply in Docker: publish the ports instead.
   - `--bind`: the address to listen on (default `127.0.0.1`).
   - `--trace`: logs each Telnet negotiation step, and each record's length. It never logs a record's contents, or the value of a NEW-ENVIRON variable that can hold a secret (`IBMSUBSPW`, `IBMRSEED`).
 - **Listening address:** by default it listens on loopback only. The image passes `--bind 0.0.0.0` so it can be reached from outside the container. Publish it on `127.0.0.1`, as above, unless you mean other machines to reach it.

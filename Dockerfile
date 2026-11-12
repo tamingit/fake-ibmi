@@ -8,7 +8,7 @@
 # in /certs on first start; mount a named volume there (-v fake-ibmi-certs:/certs) to keep it,
 # and copy /certs/fake-ibmi.crt out for clients to trust.
 # The SQLite database (source, programs, tables, spooled files) is /data/fake-ibmi.db: mount a named
-# volume on /data (-v fake-ibmi-data:/data) to keep it. Add --source-dir with a mounted folder to load source.
+# volume on /data (-v fake-ibmi-data:/data) to keep it; the users are in it too. Add --source-dir with a mounted folder to load source.
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
