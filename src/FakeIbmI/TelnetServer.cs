@@ -1,9 +1,11 @@
 // A scripted fake IBM i (TN5250E host). It negotiates, answers with a Startup Response Record,
-// shows a sign-on screen and a main menu, and records what the client sends. Placeholder text
-// only. It never logs or exposes a nondisplay field's contents.
+// shows a sign-on screen (checking the system's Users), a Change Password screen for an expired
+// password, and a main menu, and records what the client sends. Placeholder text only. It never
+// logs or exposes a nondisplay field's contents.
 
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 
 namespace FakeIbmI;
 
@@ -22,12 +24,17 @@ public sealed class TelnetServer : IAsyncDisposable
     private const byte Esc = 0x04;
     private const int EnterAid = 0xf1;
     private const int F3Aid = 0x33;
+    private const int F12Aid = 0x3c;
     private const int RollDownAid = 0xf4;
     private const int RollUpAid = 0xf5;
 
     private enum Screen
     {
         SignOn,
+
+        /// <summary>After a sign-on with an expired password: current, new and verify password.</summary>
+        ChangePassword,
+
         Main,
 
         /// <summary>A 27 x 132 screen (CLEAR UNIT ALTERNATE), from option 132 on the main menu.</summary>
@@ -40,6 +47,9 @@ public sealed class TelnetServer : IAsyncDisposable
     }
 
     private readonly TcpListener _listener;
+    private readonly TcpListener? _tlsListener;
+    private readonly TlsOptions? _tls;
+    private readonly Users _users;
     private readonly Action<string>? _log;
     private readonly bool _trace;
     private readonly object _gate = new();
@@ -48,14 +58,17 @@ public sealed class TelnetServer : IAsyncDisposable
     private readonly List<Task> _tasks = [];
     private readonly HashSet<TcpClient> _clients = [];
     private readonly CancellationTokenSource _stop = new();
-    private Task _acceptLoop = Task.CompletedTask;
+    private Task[] _acceptLoops = [];
     private int _connections;
     private int _open;
     private int _nextId;
 
-    private TelnetServer(TcpListener listener, Action<string>? log, bool trace)
+    private TelnetServer(TcpListener listener, TcpListener? tlsListener, TlsOptions? tls, Users users, Action<string>? log, bool trace)
     {
+        _users = users;
         _listener = listener;
+        _tlsListener = tlsListener;
+        _tls = tls;
         _log = log;
         _trace = trace;
     }
@@ -64,19 +77,41 @@ public sealed class TelnetServer : IAsyncDisposable
     /// Listens on the loopback interface, or on <paramref name="address"/> (the demo container
     /// listens on every interface). Port 0 picks a free port (see <see cref="Port"/>). With
     /// <paramref name="trace"/>, each Telnet negotiation step is logged, and each record's length
-    /// (never its contents, which may hold a password).
+    /// (never its contents, which may hold a password). With <paramref name="tls"/>, it also
+    /// listens for Telnet over TLS (an IBM i uses port 992), with the same sessions and devices.
+    /// The sign-on screen checks <paramref name="users"/>; pass the host servers' to share them
+    /// (the default is <see cref="Users.Defaults"/>).
     /// </summary>
     public static Task<TelnetServer> StartAsync(
-        int port = 0, Action<string>? log = null, IPAddress? address = null, bool trace = false)
+        int port = 0, Action<string>? log = null, IPAddress? address = null, bool trace = false, TlsOptions? tls = null,
+        Users? users = null)
     {
         var listener = new TcpListener(address ?? IPAddress.Loopback, port);
+        var tlsListener = tls is null ? null : new TcpListener(address ?? IPAddress.Loopback, tls.Port);
         listener.Start();
-        var host = new TelnetServer(listener, log, trace);
-        host._acceptLoop = host.AcceptLoopAsync();
+        try
+        {
+            tlsListener?.Start();
+        }
+        catch
+        {
+            listener.Stop();
+            throw;
+        }
+        var host = new TelnetServer(listener, tlsListener, tls, users ?? Users.Defaults(), log, trace);
+        host._acceptLoops = tlsListener is null
+            ? [host.AcceptLoopAsync(listener, tls: false)]
+            : [host.AcceptLoopAsync(listener, tls: false), host.AcceptLoopAsync(tlsListener, tls: true)];
         return Task.FromResult(host);
     }
 
     public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
+
+    /// <summary>The TLS port, when it listens for TLS.</summary>
+    public int? TlsPort => (_tlsListener?.LocalEndpoint as IPEndPoint)?.Port;
+
+    /// <summary>The user profiles the sign-on screen checks.</summary>
+    public Users Users => _users;
 
     /// <summary>Connections accepted so far.</summary>
     public int Connections => Volatile.Read(ref _connections);
@@ -118,10 +153,11 @@ public sealed class TelnetServer : IAsyncDisposable
     {
         _stop.Cancel();
         _listener.Stop();
+        _tlsListener?.Stop();
         await CloseAllAsync();
         try
         {
-            await _acceptLoop;
+            await Task.WhenAll(_acceptLoops);
         }
         catch (Exception e) when (e is ObjectDisposedException or SocketException or OperationCanceledException)
         {
@@ -150,14 +186,14 @@ public sealed class TelnetServer : IAsyncDisposable
         if (_trace) Log($"#{id} {line}");
     }
 
-    private async Task AcceptLoopAsync()
+    private async Task AcceptLoopAsync(TcpListener listener, bool tls)
     {
         while (!_stop.IsCancellationRequested)
         {
             TcpClient client;
             try
             {
-                client = await _listener.AcceptTcpClientAsync(_stop.Token);
+                client = await listener.AcceptTcpClientAsync(_stop.Token);
             }
             catch (Exception e) when (e is ObjectDisposedException or SocketException or OperationCanceledException)
             {
@@ -169,29 +205,36 @@ public sealed class TelnetServer : IAsyncDisposable
             lock (_gate)
             {
                 _clients.Add(client);
-                _tasks.Add(Task.Run(() => RunConnectionAsync(client, id)));
+                _tasks.Add(Task.Run(() => RunConnectionAsync(client, id, tls)));
             }
         }
     }
 
     // ---- one connection ----
 
-    private async Task RunConnectionAsync(TcpClient client, int id)
+    private async Task RunConnectionAsync(TcpClient client, int id, bool tls)
     {
-        string? device = null;
+        // The device name it holds, released however the session ends, a dropped connection included.
+        var device = new StrongBox<string?>();
         try
         {
-            Log($"#{id} connected");
-            device = await ServeAsync(client, id);
+            Log($"#{id} connected{(tls ? " (TLS)" : "")}");
+            if (!tls)
+            {
+                await ServeAsync(client.GetStream(), id, device);
+                return;
+            }
+            await using var secure = await Tls.AcceptAsync(client.GetStream(), _tls!.Certificate, $"#{id}", Log, _stop.Token);
+            if (secure is not null) await ServeAsync(secure, id, device);
         }
         catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException or OperationCanceledException)
         {
         }
         finally
         {
-            if (device is not null)
+            if (device.Value is { } held)
             {
-                lock (_gate) _devices.Remove(device);
+                lock (_gate) _devices.Remove(held);
             }
             lock (_gate) _clients.Remove(client);
             Close(client);
@@ -201,15 +244,14 @@ public sealed class TelnetServer : IAsyncDisposable
     }
 
     /// <summary>
-    /// Runs one session. Returns the device name still held when it ends, if any.
+    /// Runs one session, keeping the device name it takes in <paramref name="held"/>. Returns that name, if any.
     /// It negotiates as an IBM i does: one option at a time, asking for an option's value only once
     /// the client has agreed to the option (RFC 1091, 1572). NEW-ENVIRON first, then the terminal
     /// type, then end of record and binary both ways. A client that refuses NEW-ENVIRON still gets
     /// a session, on a device name made up for it.
     /// </summary>
-    private async Task<string?> ServeAsync(TcpClient client, int id)
+    private async Task<string?> ServeAsync(Stream stream, int id, StrongBox<string?> held)
     {
-        var stream = client.GetStream();
         var decoder = new TelnetDecoder();
         string? requested = null;
         var environment = false;
@@ -224,6 +266,7 @@ public sealed class TelnetServer : IAsyncDisposable
         var started = false;
         string? device = null;
         var screen = Screen.SignOn;
+        var session = new SignOnSession();
         var buffer = new byte[4096];
 
         async Task SendAsync(byte[] bytes, string what)
@@ -340,7 +383,7 @@ public sealed class TelnetServer : IAsyncDisposable
                         await OfferAsync(TelnetOption.Binary);
                         break;
                     case TelnetEvent.Record r when started:
-                        var (next, message) = HandleRecord(r.Data, screen);
+                        var (next, message) = HandleRecord(r.Data, screen, session);
                         if (next is null) return device;
                         screen = next.Value;
                         await SendAsync(Show(screen, message), $"screen {screen}");
@@ -364,6 +407,7 @@ public sealed class TelnetServer : IAsyncDisposable
                     {
                         device = requested ?? NextDefaultDevice();
                         _devices.Add(device);
+                        held.Value = device;
                     }
                 }
                 if (collision is not null)
@@ -470,11 +514,17 @@ public sealed class TelnetServer : IAsyncDisposable
     private static string? DevName(List<(string Kind, string Name, string? Value)> variables) =>
         variables.FirstOrDefault(v => v.Name == "DEVNAME" && !string.IsNullOrEmpty(v.Value)).Value;
 
+    /// <summary>The profile whose expired password is being changed, between sign-on and the change.</summary>
+    private sealed class SignOnSession
+    {
+        public UserProfile? Changing { get; set; }
+    }
+
     /// <summary>
     /// Applies one client record. Returns the screen to show next (null to close the
     /// connection) and an error-row message for it. A record that is not a read reply changes nothing.
     /// </summary>
-    private (Screen? Next, string? Message) HandleRecord(byte[] bytes, Screen screen)
+    private (Screen? Next, string? Message) HandleRecord(byte[] bytes, Screen screen, SignOnSession session)
     {
         if (Records.Parse(bytes) is not ParsedRecord.Data { Record: var record }) return (screen, null);
         // A read reply: cursor row, cursor column, AID, then SBA row column data for each field.
@@ -483,6 +533,8 @@ public sealed class TelnetServer : IAsyncDisposable
         if (record.Opcode is not (Opcode.NoOperation or Opcode.PutGet) || data.Length < 3 || data[0] == 0) return (screen, null);
         var aid = data[2];
         var fields = new List<ReceivedField>();
+        // Password fields' contents, kept here only: what's recorded has asterisks instead.
+        var secrets = new Dictionary<(int Row, int Column), string>();
         var i = 3;
         while (i < data.Length)
         {
@@ -493,23 +545,71 @@ public sealed class TelnetServer : IAsyncDisposable
             var start = i;
             while (i < data.Length && data[i] != 0x11) i++;
             var text = Ebcdic.Decode(data.AsSpan(start, i - start)).Replace('\0', ' ').TrimEnd();
-            var secret = screen == Screen.SignOn && row == PasswordRow && column == FieldColumn;
+            var secret = column == FieldColumn
+                         && (screen == Screen.SignOn && row == PasswordRow
+                             || screen == Screen.ChangePassword && row is CurrentPasswordRow or NewPasswordRow or VerifyPasswordRow);
+            if (secret) secrets[(row, column)] = text;
             fields.Add(new ReceivedField(row, column, secret ? new string('*', text.Length) : text));
         }
         var input = new ReceivedInput(aid, data[0], data[1], fields);
         lock (_gate) _inputs.Add(input);
 
+        string Secret(int row) => secrets.GetValueOrDefault((row, FieldColumn), "");
+
         if (screen == Screen.SignOn)
         {
-            var user = input.FieldAt(UserRow, FieldColumn)?.Trim() ?? "";
-            if (aid == EnterAid && user.Length > 0)
-            {
-                Log($"sign-on by {user}");
-                return (Screen.Main, null);
-            }
             if (aid != EnterAid) return (Screen.SignOn, null);
-            Log("sign-on rejected: user required");
-            return (Screen.SignOn, "User required");
+            var user = (input.FieldAt(UserRow, FieldColumn)?.Trim() ?? "").ToUpperInvariant();
+            if (user.Length == 0)
+            {
+                Log("sign-on rejected: user required");
+                return (Screen.SignOn, "User required");
+            }
+            // The messages are an IBM i's: CPF1120, CPF1107, CPF1394 and CPF1396.
+            var (result, profile) = _users.Check(user, Secret(PasswordRow));
+            switch (result)
+            {
+                case SignOnResult.SignedOn:
+                    Log($"sign-on by {user}");
+                    return (Screen.Main, null);
+                case SignOnResult.UnknownUser:
+                    Log($"sign-on rejected: no user {user}");
+                    return (Screen.SignOn, $"User {user} does not exist.");
+                case SignOnResult.WrongPassword:
+                    Log($"sign-on rejected: wrong password for {user}");
+                    return (Screen.SignOn, "Password not correct for user profile.");
+                case SignOnResult.Disabled:
+                    Log($"sign-on rejected: {user} is disabled");
+                    return (Screen.SignOn, $"User profile {user} cannot sign on.");
+                default:
+                    Log($"sign-on by {user}: password expired, changing it");
+                    session.Changing = profile;
+                    return (Screen.ChangePassword, "Password has expired. Password must be changed to continue sign-on request.");
+            }
+        }
+
+        if (screen == Screen.ChangePassword && session.Changing is { } changing)
+        {
+            if (aid is F3Aid or F12Aid)
+            {
+                Log($"password change for {changing.User} cancelled");
+                session.Changing = null;
+                return (Screen.SignOn, null);
+            }
+            if (aid != EnterAid) return (Screen.ChangePassword, null);
+            var (current, newPassword, verify) = (Secret(CurrentPasswordRow), Secret(NewPasswordRow), Secret(VerifyPasswordRow));
+            var problem = !_users.PasswordMatches(changing, current) ? "Current password not correct."
+                : newPassword != verify ? "New password and verify password do not match."
+                : _users.NewPasswordProblem(changing, newPassword);
+            if (problem is not null)
+            {
+                Log($"password change for {changing.User} refused: {problem}");
+                return (Screen.ChangePassword, problem);
+            }
+            changing.ChangePassword(newPassword);
+            Log($"password changed for {changing.User}; sign-on by {changing.User}");
+            session.Changing = null;
+            return (Screen.Main, "Password changed successfully.");
         }
 
         if (screen == Screen.Wide)
@@ -561,9 +661,10 @@ public sealed class TelnetServer : IAsyncDisposable
         return (Screen.Main, null);
     }
 
-    private static byte[] Show(Screen screen, string? message) => screen switch
+    private byte[] Show(Screen screen, string? message) => screen switch
     {
-        Screen.SignOn => SignOnScreen(message),
+        Screen.SignOn => SignOnScreen(message, PasswordField),
+        Screen.ChangePassword => ChangePasswordScreen(message, PasswordField),
         Screen.Wide => WideScreen(),
         Screen.List1 or Screen.List2 or Screen.List3 => ListScreen(screen - Screen.List1, message),
         _ => MainScreen(message),
@@ -574,6 +675,16 @@ public sealed class TelnetServer : IAsyncDisposable
     private const int UserRow = 6;
     private const int PasswordRow = 7;
     private const int FieldColumn = 53;
+    private const int CurrentPasswordRow = 8;
+    private const int NewPasswordRow = 10;
+    private const int VerifyPasswordRow = 12;
+
+    /// <summary>
+    /// A password field's SF: at password levels 0 and 1, 10 characters and monocase (the client
+    /// upper-cases them); at 2 and 3, case-sensitive and to the edge of the screen. Nondisplay either way.
+    /// </summary>
+    private byte[] PasswordField =>
+        _users.PasswordLevel >= 2 ? Sf(0x4000, 0x27, 80 - FieldColumn) : Sf(0x4020, 0x27, 10);
     private const int SelectionRow = 20;
     private const int SelectionColumn = 7;
 
@@ -607,7 +718,7 @@ public sealed class TelnetServer : IAsyncDisposable
     private static byte[] Message(string? message) =>
         message is null ? [] : Join(Sba(24, 2), [0x22], Text(message));
 
-    private static byte[] SignOnScreen(string? message) =>
+    private static byte[] SignOnScreen(string? message, byte[] passwordField) =>
         Screen5250(
             Header(0x18),
             Sba(1, 34),
@@ -621,7 +732,32 @@ public sealed class TelnetServer : IAsyncDisposable
             Sba(PasswordRow, 17),
             Text("Password"),
             Sba(PasswordRow, FieldColumn - 1),
-            Sf(0x4020, 0x27, 10),
+            passwordField,
+            Message(message));
+
+    private static byte[] ChangePasswordScreen(string? message, byte[] passwordField) =>
+        Screen5250(
+            Header(0x18),
+            Sba(1, 33),
+            [0x22],
+            Text("Change Password"),
+            [0x20],
+            Sba(6, 2),
+            Text("Type choices, press Enter."),
+            Sba(CurrentPasswordRow, 4),
+            Text("Current password . . . . . . . ."),
+            Sba(CurrentPasswordRow, FieldColumn - 1),
+            passwordField,
+            Sba(NewPasswordRow, 4),
+            Text("New password . . . . . . . . . ."),
+            Sba(NewPasswordRow, FieldColumn - 1),
+            passwordField,
+            Sba(VerifyPasswordRow, 4),
+            Text("New password (to verify) . . . ."),
+            Sba(VerifyPasswordRow, FieldColumn - 1),
+            passwordField,
+            Sba(22, 2),
+            Text("F3=Exit   F12=Cancel"),
             Message(message));
 
     private static byte[] MainScreen(string? message) =>
