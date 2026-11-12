@@ -3,16 +3,24 @@ namespace FakeIbmI.Tests;
 /// <summary>Db2 for i SQL translated to SQLite, and embedded SQL run from RPG.</summary>
 public class SqlTests
 {
+    /// <summary>A machine with the library the tests' tables are in.</summary>
+    private static Machine OpenMachine()
+    {
+        var machine = Machine.Open();
+        machine.Store.CreateLibrary("MYLIB");
+        return machine;
+    }
+
     [Theory]
-    [InlineData("select * from mylib/customer where id = 1", "select * from customer where id = 1")]
-    [InlineData("SELECT A.NAME FROM MYLIB.CUSTOMER A JOIN MYLIB.ORDERS O ON O.CUST = A.ID", "SELECT A.NAME FROM CUSTOMER A JOIN ORDERS O ON O.CUST = A.ID")]
+    [InlineData("select * from mylib/customer where id = 1", "select * from mylib.customer where id = 1")]
+    [InlineData("SELECT A.NAME FROM MYLIB.CUSTOMER A JOIN MYLIB.ORDERS O ON O.CUST = A.ID", "SELECT A.NAME FROM MYLIB.CUSTOMER A JOIN MYLIB.ORDERS O ON O.CUST = A.ID")]
     [InlineData("select name from customer order by name fetch first 5 rows only", "select name from customer order by name LIMIT 5")]
     [InlineData("select name from customer fetch first row only with ur", "select name from customer LIMIT 1")]
     [InlineData("select name from customer offset 10 rows fetch next 5 rows only", "select name from customer LIMIT 5 offset 10")]
     [InlineData("select first concat ' ' concat last from people for read only", "select first || ' ' || last from people")]
-    [InlineData("update mylib.customer c set c.name = 'x' where c.id = 1", "update customer AS c set c.name = 'x' where c.id = 1")]
+    [InlineData("update mylib.customer c set c.name = 'x' where c.id = 1", "update mylib.customer AS c set c.name = 'x' where c.id = 1")]
     [InlineData("delete from customer c where c.id = 1", "delete from customer AS c where c.id = 1")]
-    [InlineData("insert into qtemp/work (a, b) values (1, current date)", "insert into work (a, b) values (1, date('now', 'localtime'))")]
+    [InlineData("insert into qtemp/work (a, b) values (1, current date)", "insert into temp.work (a, b) values (1, date('now', 'localtime'))")]
     [InlineData("select trim(both from name), a / b from t", "select trim(both from name), a / b from t")]
     [InlineData("select rrn(c), name from customer c", "select c.rowid, name from customer c")]
     public void SimpleStatementsAreTranslated(string db2, string sqlite)
@@ -50,12 +58,12 @@ public class SqlTests
 
         Assert.Null(translation.Problem);
         Assert.Equal(
-            "DROP TABLE IF EXISTS CUSTOMER;\nCREATE TABLE CUSTOMER (ID INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "DROP TABLE IF EXISTS MYLIB.CUSTOMER;\nCREATE TABLE MYLIB.CUSTOMER (ID INTEGER PRIMARY KEY AUTOINCREMENT, "
             + "CUSTOMER_NAME VARCHAR(50) NOT NULL DEFAULT '', BALANCE DECIMAL(9, 2) NOT NULL DEFAULT 0, "
             + "CREATED TIMESTAMP NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now', 'localtime')))",
             translation.Sql);
-        Assert.Contains("library MYLIB is dropped: every table is in one place", translation.Notes);
         using var store = Store.Open();
+        store.CreateLibrary("MYLIB");
         Assert.Null(store.PrepareProblem(translation.Sql!));
     }
 
@@ -102,7 +110,7 @@ public class SqlTests
     [Fact]
     public void EmbeddedSqlReadsAndChangesRows()
     {
-        using var machine = Machine.Open();
+        using var machine = OpenMachine();
         var (shown, error) = RpgTests.Run(machine, Setup + """
             dcl-s id int(10) inz(1);
             dcl-s name char(20);
@@ -142,7 +150,7 @@ public class SqlTests
     [Fact]
     public void ACursorFetchesIntoADataStructureWithNullIndicators()
     {
-        using var machine = Machine.Open();
+        using var machine = OpenMachine();
         var (shown, error) = RpgTests.Run(machine, Setup + """
             dcl-ds row qualified;
               id int(10);
@@ -172,7 +180,7 @@ public class SqlTests
     [Fact]
     public void DynamicSqlIsTranslatedWhenItRuns()
     {
-        using var machine = Machine.Open();
+        using var machine = OpenMachine();
         // EXTNAME needs its table when the program starts, as a compile would.
         Assert.Empty(machine.RunScript(Setup.Replace("exec sql ", ""), "PRTUSER").Failures);
         var (shown, error) = RpgTests.Run(machine, """
@@ -202,7 +210,7 @@ public class SqlTests
     [Fact]
     public void SavingAMemberReportsItsSqlByLine()
     {
-        using var machine = Machine.Open();
+        using var machine = OpenMachine();
         var found = machine.Save(new Member("QGPL", "QRPGLESRC", "SQLPGM", "SQLRPGLE", """
             **FREE
             dcl-s n int(10);
@@ -215,20 +223,19 @@ public class SqlTests
         Assert.Equal(
         [
             (3, Severity.Info, "SQL: SET OPTION is ignored"),
-            (4, Severity.Info, "SQL: library MYLIB is dropped: every table is in one place"),
             (4, Severity.Info, "SQL: WITH UR is dropped: SQL runs without commitment control"),
-            (4, Severity.Warning, "SQL: no such table: orders (yet)"),
+            (4, Severity.Warning, "SQL: no such table: mylib.orders (yet)"),
             (5, Severity.Unsupported, "SQL: the SQL statement CALL isn't supported"),
-        ], found.Take(5).Select(d => (d.Line, d.Severity, d.Message)));
-        Assert.Equal(6, found[5].Line);
-        Assert.Equal(Severity.Unsupported, found[5].Severity);
-        Assert.StartsWith("SQL: SQLite doesn't take this statement, even translated:", found[5].Message);
+        ], found.Take(4).Select(d => (d.Line, d.Severity, d.Message)));
+        Assert.Equal(6, found[4].Line);
+        Assert.Equal(Severity.Unsupported, found[4].Severity);
+        Assert.StartsWith("SQL: SQLite doesn't take this statement, even translated:", found[4].Message);
     }
 
     [Fact]
     public void AScriptRunsStatementByStatement()
     {
-        using var machine = Machine.Open();
+        using var machine = OpenMachine();
         var job = new BatchJob("PRTUSER", CancellationToken.None);
         var member = new Member("QGPL", "QSQLSRC", "TABLES", "SQL", """
             -- the tables

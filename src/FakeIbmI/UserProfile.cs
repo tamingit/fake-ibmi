@@ -11,6 +11,9 @@ public sealed class UserProfile(string user, string password, bool passwordExpir
     private bool _passwordExpired = passwordExpired;
     private bool _disabled = disabled;
 
+    /// <summary>The library this user's names are looked for in first, and new source goes to (QGPL unless set).</summary>
+    public string DefaultLibrary { get; init; } = "QGPL";
+
     /// <summary>Called after a password or flag changes, to keep it (the database's users do).</summary>
     internal Action<UserProfile>? Changed { get; set; }
 
@@ -140,8 +143,10 @@ public sealed class Users
         foreach (var profile in defaults._fixed)
         {
             var text = profile == defaults._main ? "Signs on normally" : profile.Disabled ? "Disabled" : "Password expired";
+            var existing = store.FindUser(profile.User);
             store.SaveUser(new UserRow(profile.User, profile.Password, profile.Disabled ? "*DISABLED" : "*ENABLED",
-                profile.PasswordExpired ? "*YES" : "*NO", store.FindUser(profile.User)?.Text is { Length: > 0 } kept ? kept : text));
+                profile.PasswordExpired ? "*YES" : "*NO", existing?.Text is { Length: > 0 } kept ? kept : text,
+                existing?.DefaultLibrary ?? Store.Current));
         }
         return new Users(store, defaults._main);
     }
@@ -149,6 +154,7 @@ public sealed class Users
     private UserProfile Profile(UserRow row) =>
         new(row.User, row.Password, row.PasswordExpired == "*YES", row.Status == "*DISABLED")
         {
+            DefaultLibrary = row.DefaultLibrary,
             Changed = p => _store!.UpdateUser(p.User, p.Password, p.Disabled, p.PasswordExpired),
         };
 

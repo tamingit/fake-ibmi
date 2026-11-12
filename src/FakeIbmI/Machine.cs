@@ -22,18 +22,39 @@ public sealed partial class Machine : IDisposable
         Store = store;
     }
 
-    /// <summary>A machine on a database file, or (null) one in memory that's gone when the fake stops.</summary>
-    public static Machine Open(string? database = null) => new(Store.Open(database));
+    /// <summary>A machine on a folder of library databases, or (null) one in memory that's gone when the fake stops.</summary>
+    public static Machine Open(string? databaseDir = null) => new(Store.Open(databaseDir));
 
     public Store Store { get; }
 
     /// <summary>The library members and objects go to when none is named.</summary>
-    public string CurrentLibrary => "QGPL";
+    public string CurrentLibrary => Store.Current;
+
+    /// <summary>
+    /// The library a user's names are looked for in first, and new source goes to: the one their profile names
+    /// (DFTLIB), when there is such a library, else QGPL.
+    /// </summary>
+    public string DefaultLibrary(string user) =>
+        Store.FindUser(user.ToUpperInvariant())?.DefaultLibrary.ToUpperInvariant() is { } library && Store.HasLibrary(library) ? library : CurrentLibrary;
+
+    /// <summary>What the translator writes where SQL names no library for a table it creates: the job's default library.</summary>
+    internal const string DefaultSchemaMarker = "QFAKE_DFTLIB";
+
+    /// <summary>The SQL with the job's default library where the translator left its marker.</summary>
+    internal string Resolve(string sql, string user)
+    {
+        if (!sql.Contains(DefaultSchemaMarker, StringComparison.Ordinal)) return sql;
+        var library = DefaultLibrary(user);
+        return sql.Replace(DefaultSchemaMarker, library == CurrentLibrary ? "main" : $"\"{library}\"", StringComparison.Ordinal);
+    }
 
     public void Dispose() => Store.Dispose();
 
-    [GeneratedRegex(@"CREATE\s+(?:TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)", RegexOptions.IgnoreCase)]
+    [GeneratedRegex(@"CREATE\s+(?:TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:\w+\.)?(\w+)", RegexOptions.IgnoreCase)]
     private static partial Regex CreatedName();
+
+    [GeneratedRegex(@"^\s*CREATE\s+(?:SCHEMA|COLLECTION)\s+(\w+)\s*;?\s*$", RegexOptions.IgnoreCase)]
+    private static partial Regex CreatedLibrary();
 
     [GeneratedRegex("^[A-Z#$@][A-Z0-9#$@_.]{0,9}$")]
     private static partial Regex ObjectName();
@@ -98,7 +119,8 @@ public sealed partial class Machine : IDisposable
             {
                 // A script often creates the table its next statement uses, so a missing one isn't an error yet.
                 var missing = problem.Contains("no such table") || problem.Contains("no such column");
-                if (created.Any(name => problem.EndsWith($"no such table: {name}", StringComparison.OrdinalIgnoreCase))) continue;
+                if (created.Any(name => problem.EndsWith($"no such table: {name}", StringComparison.OrdinalIgnoreCase)
+                    || problem.EndsWith($".{name}", StringComparison.OrdinalIgnoreCase) && problem.Contains("no such table"))) continue;
                 found.Add(new Diagnostic(line, missing ? Severity.Warning : Severity.Unsupported,
                     missing ? $"{problem} (yet)" : $"SQLite doesn't take this statement, even translated: {problem}"));
             }
@@ -124,6 +146,7 @@ public sealed partial class Machine : IDisposable
     {
         library ??= member.Library;
         name ??= member.Name;
+        if (!Store.HasLibrary(library)) return new CommandResult(false, $"Library {library} not found.");
         var unsupported = Check(member.Type, member.Name, member.Source).Count(d => d.Severity == Severity.Unsupported);
         var caveat = unsupported == 0 ? "" : $" {unsupported} line{(unsupported == 1 ? "" : "s")} can't be run: see the member's diagnostics.";
         switch (member.Type)
@@ -152,6 +175,20 @@ public sealed partial class Machine : IDisposable
         var failures = new List<string>();
         foreach (var (text, line) in SqlTranslator.SplitScript(source))
         {
+            // CREATE SCHEMA (or COLLECTION) makes a library.
+            if (CreatedLibrary().Match(text) is { Success: true } schema)
+            {
+                try
+                {
+                    Store.CreateLibrary(schema.Groups[1].Value);
+                    ran++;
+                }
+                catch (Exception e) when (e is ArgumentException or InvalidOperationException)
+                {
+                    failures.Add($"line {line}: {e.Message}");
+                }
+                continue;
+            }
             var translation = SqlTranslator.Translate(text);
             if (translation.Kind == SqlKind.NoOp)
             {
@@ -168,7 +205,7 @@ public sealed partial class Machine : IDisposable
                 lock (Store.Gate)
                 {
                     using var command = Store.Connection.CreateCommand();
-                    command.CommandText = translation.Sql;
+                    command.CommandText = Resolve(translation.Sql!, user);
                     for (var i = 0; i < translation.Inputs.Count; i++) command.Parameters.AddWithValue($"@h{i}", user);
                     command.ExecuteNonQuery();
                 }
@@ -193,11 +230,12 @@ public sealed partial class Machine : IDisposable
     }
 
     /// <summary>Whether a program of this name has been created.</summary>
-    public bool HasProgram(string? library, string name) => Store.FindObject(library, name, "*PGM") is not null;
+    public bool HasProgram(string? library, string name, string? user = null) =>
+        Store.FindObject(library, name, "*PGM", user is null ? null : DefaultLibrary(user)) is not null;
 
-    internal RpgProgram? LoadProgram(string? library, string name)
+    internal RpgProgram? LoadProgram(string? library, string name, string? user = null)
     {
-        if (Store.FindObject(library, name, "*PGM") is not { } o) return null;
+        if (Store.FindObject(library, name, "*PGM", user is null ? null : DefaultLibrary(user)) is not { } o) return null;
         var cached = _programs.GetValueOrDefault((o.Library, o.Name));
         if (cached.Version == o.Version) return cached.Program;
         var program = RpgParser.Parse(o.Source);
@@ -205,9 +243,9 @@ public sealed partial class Machine : IDisposable
         return program;
     }
 
-    internal DisplayFile? LoadDisplayFile(string name)
+    internal DisplayFile? LoadDisplayFile(string name, string? user = null)
     {
-        if (Store.FindObject(null, name, "*FILE") is not { } o) return null;
+        if (Store.FindObject(null, name, "*FILE", user is null ? null : DefaultLibrary(user)) is not { } o) return null;
         var cached = _displayFiles.GetValueOrDefault((o.Library, o.Name));
         if (cached.Version == o.Version) return cached.File;
         var file = DisplayFile.Parse(o.Name, o.Source);
@@ -219,18 +257,18 @@ public sealed partial class Machine : IDisposable
     internal void Call(string program, IReadOnlyList<Cell> arguments, IJobHost host, int depth = 0)
     {
         var (library, name) = Qualified(program);
-        var parsed = LoadProgram(library, name) ?? throw new RpgHalt($"Program {name} in library {library ?? "*LIBL"} not found.");
+        var parsed = LoadProgram(library, name, host.User) ?? throw new RpgHalt($"Program {name} in library {library ?? "*LIBL"} not found.");
         new Interpreter(parsed, name, this, host, depth).Run(arguments);
     }
 
     /// <summary>The types of a program's parameters, or null when there's no such program.</summary>
     internal IReadOnlyList<RpgType>? ParameterTypes(string? library, string name, IJobHost host) =>
-        LoadProgram(library, name) is { } program ? new Interpreter(program, name, this, host).ParameterTypes() : null;
+        LoadProgram(library, name, host.User) is { } program ? new Interpreter(program, name, this, host).ParameterTypes() : null;
 
     // ---- CL commands ----
 
     /// <summary>
-    /// Runs a CL command: CALL, CRTBNDRPG, CRTSQLRPGI, CRTDSPF, RUNSQLSTM, RUNSQL, DLTPGM or DLTF.
+    /// Runs a CL command: CALL, CRTBNDRPG, CRTSQLRPGI, CRTDSPF, RUNSQLSTM, RUNSQL, CRTLIB, DLTLIB, DLTPGM or DLTF.
     /// Any other comes back as not <see cref="CommandResult.Known"/>.
     /// </summary>
     internal CommandResult Run(string text, IJobHost host)
@@ -276,11 +314,12 @@ public sealed partial class Machine : IDisposable
                 var (library, name) = Qualified(target);
                 var (sourceLibrary, sourceFile) = command.Value("SRCFILE", 1) is { } file ? Qualified(file) : (null, null);
                 var memberName = command.Value("SRCMBR", 2)?.ToUpperInvariant() is { } m && !m.StartsWith('*') ? m : name;
-                var member = Store.FindMember(sourceLibrary, sourceFile, memberName);
+                var first = DefaultLibrary(host.User);
+                var member = Store.FindMember(sourceLibrary, sourceFile, memberName, first);
                 if (member is null && sourceFile is null)
                 {
                     // No SRCFILE: the command's default, then any file with a member of the name.
-                    member = Store.FindMember(null, display ? "QDDSSRC" : "QRPGLESRC", memberName);
+                    member = Store.FindMember(null, display ? "QDDSSRC" : "QRPGLESRC", memberName, first);
                 }
                 if (member is null) return new CommandResult(false, $"Member {memberName} not found in file {sourceFile ?? (display ? "QDDSSRC" : "QRPGLESRC")}.");
                 if (display != (member.Type == "DSPF") || member.Type == "SQL")
@@ -291,7 +330,7 @@ public sealed partial class Machine : IDisposable
             {
                 if (command.Value("SRCMBR", 1) is not { } memberName) return new CommandResult(false, "Parameter SRCMBR required.");
                 var (library, file) = command.Value("SRCFILE", 0) is { } f ? Qualified(f) : (null, null);
-                var member = Store.FindMember(library, file, memberName);
+                var member = Store.FindMember(library, file, memberName, DefaultLibrary(host.User));
                 if (member is null) return new CommandResult(false, $"Member {memberName.ToUpperInvariant()} not found in file {file ?? "*LIBL"}.");
                 var (ran, failures) = RunScript(member.Source, host.User);
                 return new CommandResult(failures.Count == 0,
@@ -304,19 +343,47 @@ public sealed partial class Machine : IDisposable
                 var (ran, failures) = RunScript(sql, host.User);
                 return new CommandResult(failures.Count == 0, failures.Count == 0 ? (ran == 0 ? "No SQL statement to run." : "SQL statement run.") : failures[0][(failures[0].IndexOf(':') + 2)..]);
             }
+            case "CRTLIB":
+            {
+                if (command.Value("LIB", 0)?.ToUpperInvariant() is not { } library) return new CommandResult(false, "Parameter LIB required.");
+                try
+                {
+                    return Store.CreateLibrary(library)
+                        ? new CommandResult(true, $"Library {library} created.")
+                        : new CommandResult(false, $"Library {library} already exists.");
+                }
+                catch (Exception e) when (e is ArgumentException or InvalidOperationException)
+                {
+                    return new CommandResult(false, e.Message);
+                }
+            }
+            case "DLTLIB":
+            {
+                if (command.Value("LIB", 0)?.ToUpperInvariant() is not { } library) return new CommandResult(false, "Parameter LIB required.");
+                try
+                {
+                    return Store.DeleteLibrary(library)
+                        ? new CommandResult(true, $"Library {library} deleted.")
+                        : new CommandResult(false, $"Library {library} not found.");
+                }
+                catch (ArgumentException e)
+                {
+                    return new CommandResult(false, e.Message);
+                }
+            }
             case "DLTPGM" or "DLTF":
             {
                 var program = command.Name == "DLTPGM";
                 if (command.Value(program ? "PGM" : "FILE", 0) is not { } target) return new CommandResult(false, $"Parameter {(program ? "PGM" : "FILE")} required.");
                 var (library, name) = Qualified(target);
-                if (Store.FindObject(library, name, program ? "*PGM" : "*FILE") is { } o)
+                if (Store.FindObject(library, name, program ? "*PGM" : "*FILE", DefaultLibrary(host.User)) is { } o)
                 {
                     Store.DeleteObject(o);
                     return new CommandResult(true, $"Object {name} in {o.Library} type {o.Type} deleted.");
                 }
-                if (!program && IsName(name) && Store.Columns(name).Count > 0)
+                if (!program && IsName(name) && Store.Columns(name, library).Count > 0)
                 {
-                    RunScript($"DROP TABLE {name}", host.User);
+                    RunScript($"DROP TABLE {(library is null ? "" : $"{(library == Store.Current ? "main" : library)}.")}{name}", host.User);
                     return new CommandResult(true, $"File {name} deleted.");
                 }
                 return new CommandResult(false, $"Object {name} in library {library ?? "*LIBL"} not found.");
@@ -326,14 +393,46 @@ public sealed partial class Machine : IDisposable
         }
     }
 
+    // ---- the fake's own programs ----
+
+    /// <summary>
+    /// Puts the fake's own programs in QGPL: USRMNT, the user maintenance System Options runs, and its
+    /// display file. A member that's there already is left as it is, so it can be changed or kept.
+    /// Returns what it made.
+    /// </summary>
+    public IReadOnlyList<Member> InstallSystemSource(Action<string>? log = null)
+    {
+        var installed = new List<Member>();
+        var assembly = typeof(Machine).Assembly;
+        var names = assembly.GetManifestResourceNames().Where(n => n.StartsWith("System/", StringComparison.Ordinal))
+            .Select(n => (Resource: n, File: n["System/".Length..]))
+            .Where(n => TypeForExtension(Path.GetExtension(n.File)) is not null)
+            .OrderBy(n => Path.GetExtension(n.File) == ".dspf" ? 0 : 1).ThenBy(n => n.File, StringComparer.Ordinal);
+        foreach (var (resource, file) in names)
+        {
+            var type = TypeForExtension(Path.GetExtension(file))!;
+            var name = Path.GetFileNameWithoutExtension(file).ToUpperInvariant();
+            if (Store.FindMember(CurrentLibrary, DefaultFile(type), name) is not null) continue;
+            using var reader = new StreamReader(assembly.GetManifestResourceStream(resource)!);
+            var member = new Member(CurrentLibrary, DefaultFile(type), name, type, reader.ReadToEnd().Replace("\r\n", "\n"));
+            Save(member);
+            var result = Compile(member);
+            log?.Invoke($"source: {member} {member.Type}: {result.Message}");
+            installed.Add(member);
+        }
+        return installed;
+    }
+
     // ---- a folder of source ----
 
     /// <summary>
     /// Reads every source file under a folder (.rpgle, .sqlrpgle, .dspf, .sql) as a member named for
-    /// the file, in the source file named for its folder (or the type's default, directly under
-    /// <paramref name="directory"/>). A member that's new or changed is saved and checked, then
-    /// SQL members are run, display files created and programs created, in that order. Without
-    /// <paramref name="create"/>, nothing is created (SQL members still run: use a machine to throw away).
+    /// the file. Each folder directly under it is a library, made when it's missing; a folder in that
+    /// is the source file (MYLIB/QRPGLESRC/prog.rpgle), and a file directly in the library's folder is
+    /// in its type's default source file. Files directly under <paramref name="directory"/> go to the
+    /// current library. A member that's new or changed is saved and checked, then SQL members are run,
+    /// display files created and programs created, in that order. Without <paramref name="create"/>,
+    /// nothing is created (SQL members still run: use a machine to throw away).
     /// Returns how many lines the fake can't run.
     /// </summary>
     public int Import(string directory, Action<string> log, bool create = true)
@@ -345,14 +444,18 @@ public sealed partial class Machine : IDisposable
         {
             if (TypeForExtension(Path.GetExtension(path)) is not { } type) continue;
             var name = Path.GetFileNameWithoutExtension(path).ToUpperInvariant();
-            var folder = Path.GetDirectoryName(path)!;
-            var file = folder == root ? DefaultFile(type) : Path.GetFileName(folder).ToUpperInvariant();
-            if (!IsName(name) || !IsName(file))
+            var folders = Path.GetRelativePath(root, Path.GetDirectoryName(path)!).Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries)
+                .Where(f => f != ".").Select(f => f.ToUpperInvariant()).ToList();
+            var library = folders.Count > 0 ? folders[0] : CurrentLibrary;
+            var file = folders.Count > 1 ? folders[^1] : DefaultFile(type);
+            var bad = !Store.IsLibraryName(library) ? library : !IsName(file) ? file : !IsName(name) ? name : null;
+            if (bad is not null)
             {
-                log($"source: {Path.GetRelativePath(root, path)} skipped: {(IsName(name) ? file : name)} isn't a name of up to 10 letters and digits");
+                log($"source: {Path.GetRelativePath(root, path)} skipped: {bad} isn't a name of up to 10 letters and digits");
                 continue;
             }
-            var member = new Member(CurrentLibrary, file, name, type, System.IO.File.ReadAllText(path).Replace("\r\n", "\n"));
+            if (Store.CreateLibrary(library)) log($"source: library {library} created");
+            var member = new Member(library, file, name, type, System.IO.File.ReadAllText(path).Replace("\r\n", "\n"));
             var existing = Store.FindMember(member.Library, member.File, member.Name);
             var made = type == "SQL" || Store.FindObject(member.Library, name, type == "DSPF" ? "*FILE" : "*PGM") is not null;
             if (existing == member && made) continue;

@@ -125,7 +125,7 @@ public sealed class RemoteCommandServer : HostServer
         var name = CommandName(command);
         Record($"CMD {name}");
         // A CALL of a program the machine doesn't have is some IBM program: it succeeds unrun, like any command the machine doesn't know.
-        if (name != "(not a command name)" && (name != "CALL" || CallsMyProgram(command)))
+        if (name != "(not a command name)" && (name != "CALL" || CallsMyProgram(command, user)))
         {
             var job = new BatchJob(user, Stopping);
             var result = await OnProgramThread(() => Machine.Run(command, job));
@@ -179,7 +179,7 @@ public sealed class RemoteCommandServer : HostServer
 
         var name = $"{library}/{program}";
         var real = Machine.Qualified(name);
-        if (Machine.HasProgram(real.Library, real.Name))
+        if (Machine.HasProgram(real.Library, real.Name, user))
         {
             Record($"PGM {name}");
             var (failure, results) = await OnProgramThread(() => RunProgram(name, parameters, user));
@@ -218,13 +218,13 @@ public sealed class RemoteCommandServer : HostServer
         return Frame(ServerId, 0x8003, [0, 0, 0, 0], correlation, 0, [.. outputs]);
     }
 
-    private bool CallsMyProgram(string command)
+    private bool CallsMyProgram(string command, string user)
     {
         try
         {
             if (ClCommand.Parse(command).Value("PGM", 0) is not { } program) return false;
             var (library, name) = Machine.Qualified(program);
-            return Machine.HasProgram(library, name);
+            return Machine.HasProgram(library, name, user);
         }
         catch (FormatException)
         {

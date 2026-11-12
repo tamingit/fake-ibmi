@@ -280,7 +280,7 @@ public static class SqlTranslator
 
         if (Starts("SET", "OPTION")) return NoOp(notes, "SET OPTION is ignored");
         if (Starts("SET", "CURRENT") || Starts("SET", "SCHEMA") || Starts("SET", "PATH"))
-            return NoOp(notes, $"SET {t[1].Text.ToUpperInvariant()} is ignored: library names in SQL are dropped");
+            return NoOp(notes, $"SET {t[1].Text.ToUpperInvariant()} is ignored: name the library in each table, as LIB.TABLE");
         if (Starts("SET", "TRANSACTION")) return NoOp(notes, "SET TRANSACTION is ignored: SQL runs without commitment control");
         if (Starts("COMMIT") || Starts("ROLLBACK"))
             return NoOp(notes, $"{t[0].Text.ToUpperInvariant()} is ignored: SQL runs without commitment control");
@@ -288,7 +288,7 @@ public static class SqlTranslator
         if (Starts("LABEL", "ON") || Starts("COMMENT", "ON") || Starts("GRANT") || Starts("REVOKE"))
             return NoOp(notes, $"{t[0].Text.ToUpperInvariant()} is ignored");
         if (Starts("CREATE", "SCHEMA") || Starts("CREATE", "COLLECTION"))
-            return NoOp(notes, "CREATE SCHEMA is ignored: library names in SQL are dropped");
+            return NoOp(notes, "CREATE SCHEMA makes the library in a script (or use CRTLIB); it does nothing in a program");
         if (Starts("WHENEVER")) throw new Unsupported("WHENEVER isn't supported: test SQLCODE or SQLSTATE after each statement");
 
         if (Starts("SET") && t.Count > 3 && t[1].Type == T.Host && t[2].IsSymbol("="))
@@ -430,6 +430,11 @@ public static class SqlTranslator
             if (!notes.Contains(note)) notes.Add(note);
         }
         Token Word(string text) => new(T.Word, text);
+        // A library is a schema of the connection; QGPL's database is the connection's own, SQLite's "main".
+        // QTEMP, the job's temporary library, is SQLite's temp.
+        Token Schema(Token library) =>
+            library.Text.Equals("QGPL", StringComparison.OrdinalIgnoreCase) ? Word("main")
+            : library.Text.Equals("QTEMP", StringComparison.OrdinalIgnoreCase) ? Word("temp") : library;
         Token Symbol(string text, bool spaced = true) => new(T.Symbol, text, spaced);
         bool At(int i, params string[] words) => i >= 0 && i + words.Length <= t.Count && words.Select((w, k) => t[i + k].Is(w)).All(b => b);
         var query = t[0].IsAny("SELECT", "WITH", "VALUES");
@@ -468,8 +473,10 @@ public static class SqlTranslator
         var prefix = new List<Token>();
         if (At(0, "CREATE", "OR", "REPLACE") && t.Count > 4 && t[3].IsAny("TABLE", "VIEW"))
         {
-            var nameAt = t.Count > 6 && t[5].Type == T.Symbol && t[5].Text is "." or "/" ? 6 : 4;
-            prefix = [new Token(T.Word, "DROP", false), Word(t[3].Text.ToUpperInvariant()), Word("IF"), Word("EXISTS"), t[nameAt] with { Spaced = true }, Symbol(";", false)];
+            var qualified = t.Count > 6 && t[5].Type == T.Symbol && t[5].Text is "." or "/";
+            Token[] name = qualified ? [Schema(t[4]) with { Spaced = true }, Symbol(".", false), t[6] with { Spaced = false }]
+                : [Word(Machine.DefaultSchemaMarker) with { Spaced = true }, Symbol(".", false), t[4] with { Spaced = false }];
+            prefix = [new Token(T.Word, "DROP", false), Word(t[3].Text.ToUpperInvariant()), Word("IF"), Word("EXISTS"), .. name, Symbol(";", false)];
             if (t[3].Is("TABLE")) Note("CREATE OR REPLACE TABLE drops the table and its rows first");
             t.RemoveRange(1, 2);
         }
@@ -495,14 +502,22 @@ public static class SqlTranslator
                     throw new Unsupported($"{token.Text.ToUpperInvariant()} in FROM isn't supported");
                 if (next is not null && next.Type == T.Symbol && next.Text is "." or "/" && i + 2 < t.Count && t[i + 2].Type is T.Word or T.Quoted)
                 {
-                    if (SystemSchemas.Contains(token.Text, StringComparer.OrdinalIgnoreCase) && !t[i + 2].Is("SYSDUMMY1"))
+                    var isSystem = SystemSchemas.Contains(token.Text, StringComparer.OrdinalIgnoreCase);
+                    if (isSystem && !t[i + 2].Is("SYSDUMMY1"))
                         throw new Unsupported($"{token.Text.ToUpperInvariant()}.{t[i + 2].Text.ToUpperInvariant()} isn't supported: the fake has no system catalog or services");
-                    Note($"library {token.Text.ToUpperInvariant()} is dropped: every table is in one place");
-                    result.Add(t[i + 2] with { Spaced = token.Spaced });
+                    // SYSIBM.SYSDUMMY1 is the one system table there is: in QGPL's database, found without a library.
+                    if (isSystem)
+                        result.Add(t[i + 2] with { Spaced = token.Spaced });
+                    else
+                        result.AddRange([Schema(token) with { Spaced = token.Spaced }, Symbol(".", false), t[i + 2] with { Spaced = false }]);
                     i += 2;
                     continue;
                 }
-                result.Add(token);
+                // A table made with no library goes in the job's default library, which the machine fills in when it runs.
+                if (At(0, "CREATE") && previous is not null && previous.IsAny("TABLE", "VIEW", "EXISTS") && !t.Any(x => x.Is("INDEX")))
+                    result.AddRange([Word(Machine.DefaultSchemaMarker) with { Spaced = token.Spaced }, Symbol(".", false), token with { Spaced = false }]);
+                else
+                    result.Add(token);
                 continue;
             }
             if (token.Type != T.Word || !token.IsAny("IF", "NOT", "EXISTS", "ONLY")) expectTable = false;

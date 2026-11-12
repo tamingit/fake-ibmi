@@ -249,6 +249,9 @@ public class ProgramScreenTests
         await using var client = await SignOnAsync(host);
 
         await CommandAsync(client, "5");
+        await client.WaitForTextAsync("System Options");
+        await TypeAtAsync(client, 12, 20, "3");
+        await client.EnterAsync();
         await client.WaitForTextAsync("Work with Members");
         Assert.Contains("No members", client.Text());
         await client.PressAsync(new FunctionKey("F6"));
@@ -389,13 +392,19 @@ public class ProgramScreenTests
     public async Task TheUserAppCreatesChangesAndDeletesUsersTheServersSignOn()
     {
         using var machine = Machine.Open();
-        var lines = new List<string>();
-        Assert.Equal(0, machine.Import(Path.Combine(Examples(), "..", "users"), lines.Add));
-        Assert.DoesNotContain(lines, l => l.Contains("warning") || l.Contains("not supported"));
+        machine.Store.CreateLibrary("SALES");
+        var installed = machine.InstallSystemSource();
+        Assert.Equal(["QGPL/QDDSSRC(USRMNTD)", "QGPL/QRPGLESRC(USRMNT)"], installed.Select(m => m.ToString()));
+        Assert.All(installed, m => Assert.DoesNotContain(machine.Store.Diagnostics(m), d => d.Severity != Severity.Info));
+        Assert.Empty(machine.InstallSystemSource());
         var users = Users.Open(machine.Store, new Dictionary<string, string>());
         await using var host = await TelnetServer.StartAsync(users: users, machine: machine);
         await using var client = await SignOnAsync(host);
-        await CommandAsync(client, "call usrmnt");
+        // System Options on the main menu, then option 1.
+        await CommandAsync(client, "5");
+        await client.WaitForTextAsync("System Options");
+        await TypeAtAsync(client, 12, 20, "1");
+        await client.EnterAsync();
         await client.WaitForTextAsync("Work with Users");
         Assert.Contains("PRTUSER", client.Text());
         Assert.Contains("*DISABLED", client.Text());
@@ -411,9 +420,16 @@ public class ProgramScreenTests
         await client.EnterAsync();
         await client.WaitForTextAsync("The passwords are not the same");
         await TypeAtAsync(client, 6, 25, "Pass1");
+        // The default library has to be one there is.
+        await TypeAtAsync(client, 10, 25, "nope");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("Library not found");
+        await TypeAtAsync(client, 10, 25, "sales");
         await client.EnterAsync();
         await client.WaitForTextAsync("User ADA created.");
         Assert.Equal(SignOnResult.SignedOn, users.Check("ada", "Pass1").Result);
+        Assert.Equal("SALES", users.Find("ADA")!.DefaultLibrary);
+        Assert.Contains("SALES", client.Text());
 
         // 2 beside ADA (the first, by name): disable it. A blank password keeps the old one.
         await TypeAtAsync(client, 7, 3, "2");
@@ -432,6 +448,54 @@ public class ProgramScreenTests
         await client.EnterAsync();
         await client.WaitForTextAsync("User ADA deleted.");
         Assert.Equal(SignOnResult.UnknownUser, users.Check("ADA", "Pass1").Result);
+
+        await client.PressAsync(new FunctionKey("F3"));
+        await client.WaitForTextAsync("IBM i Main Menu");
+    }
+
+    [Fact]
+    public async Task WrkLibListsMakesAndDeletesLibraries()
+    {
+        using var machine = Machine.Open();
+        machine.Save(new Member("QGPL", "QRPGLESRC", "ONE", "RPGLE", "**FREE\nreturn;\n"));
+        await using var host = await TelnetServer.StartAsync(machine: machine);
+        await using var client = await SignOnAsync(host);
+        await CommandAsync(client, "wrklib");
+        await client.WaitForTextAsync("Work with Libraries");
+        Assert.Contains("QGPL", client.Text());
+        Assert.Contains("Your default library", client.Text());
+
+        // F6: a name is needed, and one that's there already is refused.
+        await client.PressAsync(new FunctionKey("F6"));
+        await client.WaitForTextAsync("Create Library");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("Library name required.");
+        await TypeAtAsync(client, 6, 30, "qgpl");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("Library QGPL already exists.");
+        await TypeAtAsync(client, 6, 30, "sales");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("Library SALES created.");
+        Assert.Contains("SALES", client.Text());
+        Assert.True(machine.Store.HasLibrary("SALES"));
+
+        // 4 beside QGPL is refused; beside SALES it asks first.
+        await TypeAtAsync(client, 7, 3, "4");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("can't be deleted");
+        await TypeAtAsync(client, 8, 3, "4");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("Confirm Delete of Library");
+        Assert.Contains("0 source members", client.Text());
+        await client.PressAsync(new FunctionKey("F12"));
+        await client.WaitForTextAsync("Work with Libraries");
+        Assert.True(machine.Store.HasLibrary("SALES"));
+        await TypeAtAsync(client, 8, 3, "4");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("Confirm Delete of Library");
+        await client.EnterAsync();
+        await client.WaitForTextAsync("Library SALES deleted.");
+        Assert.False(machine.Store.HasLibrary("SALES"));
 
         await client.PressAsync(new FunctionKey("F3"));
         await client.WaitForTextAsync("IBM i Main Menu");
@@ -551,11 +615,11 @@ public class ProgramScreenTests
         var folder = Directory.CreateTempSubdirectory("fake-ibmi-source");
         try
         {
-            File.WriteAllText(Path.Combine(folder.FullName, "tables.sql"), "create table mylib.part (code char(5) not null, qty int);\ninsert into part values ('A1', 3);\n");
+            Directory.CreateDirectory(Path.Combine(folder.FullName, "MYLIB", "MYSRC"));
+            File.WriteAllText(Path.Combine(folder.FullName, "MYLIB", "tables.sql"), "create table mylib.part (code char(5) not null, qty int);\ninsert into part values ('A1', 3);\n");
             File.WriteAllText(Path.Combine(folder.FullName, "count.sqlrpgle"),
                 "**FREE\ndcl-s n int(10);\nexec sql select sum(qty) into :n from mylib/part;\ndsply %char(n);\nin dataarea;\nreturn;\n");
-            Directory.CreateDirectory(Path.Combine(folder.FullName, "MYSRC"));
-            File.WriteAllText(Path.Combine(folder.FullName, "MYSRC", "menu.dspf"), Dds(spec: "R", name: "MENU") + "\n" + Dds("'Menu'", row: "1", column: "2") + "\n");
+            File.WriteAllText(Path.Combine(folder.FullName, "MYLIB", "MYSRC", "menu.dspf"), Dds(spec: "R", name: "MENU") + "\n" + Dds("'Menu'", row: "1", column: "2") + "\n");
             File.WriteAllText(Path.Combine(folder.FullName, "notes.txt"), "not source");
             using var machine = Machine.Open();
             var lines = new List<string>();
@@ -567,8 +631,9 @@ public class ProgramScreenTests
             Assert.Equal(0, again);
             Assert.Equal(
             [
-                "source: QGPL/QSQLSRC(TABLES) SQL: 2 SQL statements run from QGPL/QSQLSRC(TABLES).",
-                "source: QGPL/MYSRC(MENU) DSPF: File MENU created in library QGPL.",
+                "source: library MYLIB created",
+                "source: MYLIB/QSQLSRC(TABLES) SQL: 2 SQL statements run from MYLIB/QSQLSRC(TABLES).",
+                "source: MYLIB/MYSRC(MENU) DSPF: File MENU created in library MYLIB.",
                 "source: QGPL/QRPGLESRC(COUNT) SQLRPGLE: Program COUNT created in library QGPL. 1 line can't be run: see the member's diagnostics.",
                 "source:   line 5: not supported: data areas isn't supported (IN)",
             ], lines);

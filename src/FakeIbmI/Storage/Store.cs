@@ -1,8 +1,12 @@
-// The fake's SQLite database: source members, the objects made from them (programs and display
-// files), what the last save of a member found unsupported, and the tables embedded SQL works on.
-// One connection, used under a lock: programs run on their own threads.
+// The fake's SQLite databases, one for each library: its source members, the objects made from
+// them (programs and display files), what the last save of a member found unsupported, and the
+// tables embedded SQL works on. QGPL's database is the connection's own ("main"), and also holds
+// the system's tables (the users and the spooled files); every other library is attached under
+// its own name, so SQL can say LIB.TABLE. One connection, used under a lock: programs run on
+// their own threads.
 
 using System.Globalization;
+using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 
 namespace FakeIbmI;
@@ -31,19 +35,25 @@ public sealed record Member(string Library, string File, string Name, string Typ
 /// <summary>A spooled file a program printed: its lines, as text.</summary>
 public sealed record SpoolRecord(long Id, string Name, string User, int Pages, int Width, DateTime Created, string Text);
 
-/// <summary>One user profile as the table QFAKE_USER keeps it. Status is *ENABLED or *DISABLED, PasswordExpired *YES or *NO.</summary>
-public sealed record UserRow(string User, string Password, string Status, string PasswordExpired, string Text);
+/// <summary>One user profile as the table QFAKE_USER keeps it. Status is *ENABLED or *DISABLED, PasswordExpired *YES or *NO; DefaultLibrary (DFTLIB) is the library the user's names are looked for in first, and new source goes to.</summary>
+public sealed record UserRow(string User, string Password, string Status, string PasswordExpired, string Text, string DefaultLibrary = "QGPL");
 
 /// <summary>An object made from a member: type *PGM or *FILE, with the source it was made from.</summary>
 public sealed record StoredObject(string Library, string Name, string Type, string Attribute, string Source, long Version);
 
-public sealed class Store : IDisposable
+public sealed partial class Store : IDisposable
 {
-    private readonly SqliteConnection _connection;
+    /// <summary>The library that holds the system's tables and the SQL a program doesn't qualify; its database is the connection's own.</summary>
+    public const string Current = "QGPL";
 
-    private Store(SqliteConnection connection)
+    private readonly SqliteConnection _connection;
+    private readonly string? _directory;
+    private readonly SortedSet<string> _others = new(StringComparer.Ordinal);
+
+    private Store(SqliteConnection connection, string? directory)
     {
         _connection = connection;
+        _directory = directory;
     }
 
     /// <summary>Guards every use of <see cref="Connection"/>.</summary>
@@ -51,34 +61,156 @@ public sealed class Store : IDisposable
 
     internal SqliteConnection Connection => _connection;
 
-    /// <summary>Opens the database file, making it when it's missing. Null keeps it in memory, gone when the fake stops.</summary>
-    public static Store Open(string? path = null)
+    [GeneratedRegex("^[A-Z#$@][A-Z0-9#$@_]{0,9}$")]
+    private static partial Regex LibraryNamePattern();
+
+    /// <summary>Whether this is a name a library can have: 1 to 10 letters, digits, #, $, @ and _, not starting with a digit.</summary>
+    public static bool IsLibraryName(string name) => LibraryNamePattern().IsMatch(name);
+
+    /// <summary>
+    /// Opens the libraries in a folder, each the file NAME.db in it (QGPL.db, which is made when it's
+    /// missing, and every other .db file with a library's name). Null keeps every library in memory, gone when the fake stops.
+    /// </summary>
+    public static Store Open(string? directory = null)
     {
-        var connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = path ?? ":memory:" }.ToString());
+        if (directory is not null) Directory.CreateDirectory(directory);
+        var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = directory is null ? ":memory:" : System.IO.Path.Combine(directory, Current + ".db"),
+            // A pooled connection would keep the libraries attached after the store is gone, and their files locked.
+            Pooling = false,
+        }.ToString());
         connection.Open();
-        var store = new Store(connection);
+        var store = new Store(connection, directory);
         Db2Functions.Register(connection);
+        store.Prepare("main");
         store.Run("""
-            CREATE TABLE IF NOT EXISTS QFAKE_MEMBER (
-                LIBRARY TEXT NOT NULL, FILE TEXT NOT NULL, NAME TEXT NOT NULL, TYPE TEXT NOT NULL, SOURCE TEXT NOT NULL,
-                PRIMARY KEY (LIBRARY, FILE, NAME));
-            CREATE TABLE IF NOT EXISTS QFAKE_DIAGNOSTIC (
-                LIBRARY TEXT NOT NULL, FILE TEXT NOT NULL, NAME TEXT NOT NULL, SEQ INTEGER NOT NULL,
-                LINE INTEGER NOT NULL, SEVERITY INTEGER NOT NULL, MESSAGE TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS QFAKE_OBJECT (
-                LIBRARY TEXT NOT NULL, NAME TEXT NOT NULL, TYPE TEXT NOT NULL, ATTRIBUTE TEXT NOT NULL, SOURCE TEXT NOT NULL,
-                VERSION INTEGER NOT NULL, PRIMARY KEY (LIBRARY, NAME, TYPE));
             CREATE TABLE IF NOT EXISTS QFAKE_SPOOL (
                 ID INTEGER PRIMARY KEY AUTOINCREMENT, NAME TEXT NOT NULL, USER TEXT NOT NULL, PAGES INTEGER NOT NULL,
                 WIDTH INTEGER NOT NULL, CREATED TEXT NOT NULL, TEXT TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS QFAKE_USER (
                 USERNAME TEXT NOT NULL PRIMARY KEY, PASSWORD TEXT NOT NULL, STATUS TEXT NOT NULL DEFAULT '*ENABLED',
-                PWDEXP TEXT NOT NULL DEFAULT '*NO', TEXT TEXT NOT NULL DEFAULT '');
+                PWDEXP TEXT NOT NULL DEFAULT '*NO', TEXT TEXT NOT NULL DEFAULT '', DFTLIB TEXT NOT NULL DEFAULT 'QGPL');
+            CREATE TABLE IF NOT EXISTS QFAKE_LIBRARY (NAME TEXT NOT NULL PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS SYSDUMMY1 (IBMREQD TEXT NOT NULL);
             INSERT INTO SYSDUMMY1 SELECT 'Y' WHERE NOT EXISTS (SELECT 1 FROM SYSDUMMY1);
             """);
+        // A database from before users had a default library.
+        if (store.Query("SELECT count(*) FROM pragma_table_info('QFAKE_USER') WHERE name = 'DFTLIB'", r => r.GetInt64(0))[0] == 0)
+            store.Run("ALTER TABLE QFAKE_USER ADD COLUMN DFTLIB TEXT NOT NULL DEFAULT 'QGPL'");
+        store.Run("DELETE FROM QFAKE_LIBRARY; INSERT INTO QFAKE_LIBRARY VALUES ('QGPL')");
+        if (directory is not null)
+        {
+            foreach (var file in Directory.EnumerateFiles(directory, "*.db").Order(StringComparer.Ordinal))
+            {
+                var name = System.IO.Path.GetFileNameWithoutExtension(file);
+                if (name != Current && IsLibraryName(name)) store.CreateLibrary(name);
+            }
+        }
         return store;
     }
+
+    // ---- libraries ----
+
+    /// <summary>
+    /// The libraries in the order a name without one is looked for: <paramref name="first"/> (a user's default
+    /// library, when there is such a library), then QGPL, then the rest by name.
+    /// </summary>
+    public IReadOnlyList<string> Libraries(string? first = null)
+    {
+        lock (Gate)
+        {
+            List<string> all = [Current, .. _others];
+            if (first?.ToUpperInvariant() is { } f && all.Remove(f)) all.Insert(0, f);
+            return all;
+        }
+    }
+
+    public bool HasLibrary(string name)
+    {
+        name = name.ToUpperInvariant();
+        lock (Gate) return name == Current || _others.Contains(name);
+    }
+
+    /// <summary>The name SQLite knows the library's database by.</summary>
+    private string Schema(string library)
+    {
+        library = library.ToUpperInvariant();
+        if (library == Current) return "main";
+        lock (Gate)
+        {
+            if (!_others.Contains(library)) throw new ArgumentException($"Library {library} not found.");
+        }
+        return $"\"{library}\"";
+    }
+
+    /// <summary>Makes the library (its database file, when the fake keeps them) or opens it. False when it already was there.</summary>
+    public bool CreateLibrary(string name)
+    {
+        name = name.ToUpperInvariant();
+        if (!IsLibraryName(name)) throw new ArgumentException($"{name} isn't a library name: 1 to 10 letters, digits, #, $, @ and _.");
+        lock (Gate)
+        {
+            if (HasLibrary(name)) return false;
+            try
+            {
+                Run($"ATTACH DATABASE @p AS \"{name}\"", ("@p", _directory is null ? ":memory:" : System.IO.Path.Combine(_directory, name + ".db")));
+            }
+            catch (SqliteException e) when (e.Message.Contains("too many attached"))
+            {
+                throw new InvalidOperationException($"Library {name} can't be made: there can be at most {_others.Count + 1} libraries (SQLite's limit on attached databases).");
+            }
+            Prepare($"\"{name}\"");
+            _others.Add(name);
+            Run("INSERT OR IGNORE INTO QFAKE_LIBRARY VALUES (@n)", ("@n", name));
+            return true;
+        }
+    }
+
+    /// <summary>Takes the library away, with its database file. False when there's no such library. QGPL can't be deleted.</summary>
+    public bool DeleteLibrary(string name)
+    {
+        name = name.ToUpperInvariant();
+        if (name == Current) throw new ArgumentException($"Library {Current} can't be deleted: it holds the system's tables.");
+        lock (Gate)
+        {
+            if (!_others.Remove(name)) return false;
+            Run($"DETACH DATABASE \"{name}\"");
+            Run("DELETE FROM QFAKE_LIBRARY WHERE NAME = @n", ("@n", name));
+            if (_directory is not null)
+            {
+                foreach (var suffix in new[] { "", "-journal", "-wal", "-shm" })
+                {
+                    var file = System.IO.Path.Combine(_directory, name + ".db" + suffix);
+                    if (System.IO.File.Exists(file)) System.IO.File.Delete(file);
+                }
+            }
+            return true;
+        }
+    }
+
+    /// <summary>What a library holds: its source members, its objects (programs and display files) and its SQL tables.</summary>
+    public (int Members, int Objects, int Tables) Counts(string library)
+    {
+        var schema = Schema(library);
+        int Count(string sql) => (int)(long)Query(sql, r => r.GetInt64(0))[0];
+        return (Count($"SELECT count(*) FROM {schema}.QFAKE_MEMBER"), Count($"SELECT count(*) FROM {schema}.QFAKE_OBJECT"),
+            Count($"SELECT count(*) FROM {schema}.sqlite_master WHERE type = 'table' AND name NOT LIKE 'QFAKE!_%' ESCAPE '!' "
+                + "AND name NOT LIKE 'sqlite!_%' ESCAPE '!' AND name <> 'SYSDUMMY1'"));
+    }
+
+    /// <summary>Makes a library's own tables, in the database of this schema.</summary>
+    private void Prepare(string schema) => Run($"""
+        CREATE TABLE IF NOT EXISTS {schema}.QFAKE_MEMBER (
+            LIBRARY TEXT NOT NULL, FILE TEXT NOT NULL, NAME TEXT NOT NULL, TYPE TEXT NOT NULL, SOURCE TEXT NOT NULL,
+            PRIMARY KEY (LIBRARY, FILE, NAME));
+        CREATE TABLE IF NOT EXISTS {schema}.QFAKE_DIAGNOSTIC (
+            LIBRARY TEXT NOT NULL, FILE TEXT NOT NULL, NAME TEXT NOT NULL, SEQ INTEGER NOT NULL,
+            LINE INTEGER NOT NULL, SEVERITY INTEGER NOT NULL, MESSAGE TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS {schema}.QFAKE_OBJECT (
+            LIBRARY TEXT NOT NULL, NAME TEXT NOT NULL, TYPE TEXT NOT NULL, ATTRIBUTE TEXT NOT NULL, SOURCE TEXT NOT NULL,
+            VERSION INTEGER NOT NULL, PRIMARY KEY (LIBRARY, NAME, TYPE));
+        """);
 
     public void Dispose() => _connection.Dispose();
 
@@ -118,14 +250,15 @@ public sealed class Store : IDisposable
     {
         lock (Gate)
         {
+            var schema = Schema(member.Library);
             using var transaction = _connection.BeginTransaction();
-            Run("INSERT OR REPLACE INTO QFAKE_MEMBER VALUES (@l, @f, @n, @t, @s)",
+            Run($"INSERT OR REPLACE INTO {schema}.QFAKE_MEMBER VALUES (@l, @f, @n, @t, @s)",
                 ("@l", member.Library), ("@f", member.File), ("@n", member.Name), ("@t", member.Type), ("@s", member.Source));
-            Run("DELETE FROM QFAKE_DIAGNOSTIC WHERE LIBRARY = @l AND FILE = @f AND NAME = @n",
+            Run($"DELETE FROM {schema}.QFAKE_DIAGNOSTIC WHERE LIBRARY = @l AND FILE = @f AND NAME = @n",
                 ("@l", member.Library), ("@f", member.File), ("@n", member.Name));
             for (var i = 0; i < diagnostics.Count; i++)
             {
-                Run("INSERT INTO QFAKE_DIAGNOSTIC VALUES (@l, @f, @n, @q, @line, @sev, @m)",
+                Run($"INSERT INTO {schema}.QFAKE_DIAGNOSTIC VALUES (@l, @f, @n, @q, @line, @sev, @m)",
                     ("@l", member.Library), ("@f", member.File), ("@n", member.Name), ("@q", i),
                     ("@line", diagnostics[i].Line), ("@sev", (int)diagnostics[i].Severity), ("@m", diagnostics[i].Message));
             }
@@ -137,28 +270,33 @@ public sealed class Store : IDisposable
 
     /// <summary>Every member, by library, file and name.</summary>
     public IReadOnlyList<Member> Members() =>
-        Query("SELECT LIBRARY, FILE, NAME, TYPE, SOURCE FROM QFAKE_MEMBER ORDER BY LIBRARY, FILE, NAME", ReadMember);
+        [.. Libraries()
+            .SelectMany(l => Query($"SELECT LIBRARY, FILE, NAME, TYPE, SOURCE FROM {Schema(l)}.QFAKE_MEMBER", ReadMember))
+            .OrderBy(m => m.Library, StringComparer.Ordinal).ThenBy(m => m.File, StringComparer.Ordinal).ThenBy(m => m.Name, StringComparer.Ordinal)];
+
+    /// <summary>The libraries a lookup goes through: the one named, or (none named: *LIBL) all of them, in order.</summary>
+    private IEnumerable<string> LibrariesFor(string? library, string? first = null) =>
+        library is null ? Libraries(first) : HasLibrary(library) ? [library.ToUpperInvariant()] : [];
 
     /// <summary>The member of this name. A null library or file matches any, as *LIBL would.</summary>
-    public Member? FindMember(string? library, string? file, string name) =>
-        Query("""
-            SELECT LIBRARY, FILE, NAME, TYPE, SOURCE FROM QFAKE_MEMBER
-            WHERE NAME = @n AND (@l IS NULL OR LIBRARY = @l) AND (@f IS NULL OR FILE = @f) ORDER BY LIBRARY, FILE
-            """, ReadMember, ("@n", name.ToUpperInvariant()), ("@l", library?.ToUpperInvariant()), ("@f", file?.ToUpperInvariant()))
-            .FirstOrDefault();
+    public Member? FindMember(string? library, string? file, string name, string? first = null) =>
+        LibrariesFor(library, first).Select(l =>
+            Query($"SELECT LIBRARY, FILE, NAME, TYPE, SOURCE FROM {Schema(l)}.QFAKE_MEMBER WHERE NAME = @n AND (@f IS NULL OR FILE = @f) ORDER BY FILE",
+                ReadMember, ("@n", name.ToUpperInvariant()), ("@f", file?.ToUpperInvariant())).FirstOrDefault())
+            .FirstOrDefault(m => m is not null);
 
     public void DeleteMember(Member member)
     {
         foreach (var table in new[] { "QFAKE_MEMBER", "QFAKE_DIAGNOSTIC" })
         {
-            Run($"DELETE FROM {table} WHERE LIBRARY = @l AND FILE = @f AND NAME = @n",
+            Run($"DELETE FROM {Schema(member.Library)}.{table} WHERE LIBRARY = @l AND FILE = @f AND NAME = @n",
                 ("@l", member.Library), ("@f", member.File), ("@n", member.Name));
         }
     }
 
     /// <summary>What the last save of the member found.</summary>
     public IReadOnlyList<Diagnostic> Diagnostics(Member member) =>
-        Query("SELECT LINE, SEVERITY, MESSAGE FROM QFAKE_DIAGNOSTIC WHERE LIBRARY = @l AND FILE = @f AND NAME = @n ORDER BY SEQ",
+        Query($"SELECT LINE, SEVERITY, MESSAGE FROM {Schema(member.Library)}.QFAKE_DIAGNOSTIC WHERE LIBRARY = @l AND FILE = @f AND NAME = @n ORDER BY SEQ",
             r => new Diagnostic(r.GetInt32(0), (Severity)r.GetInt32(1), r.GetString(2)),
             ("@l", member.Library), ("@f", member.File), ("@n", member.Name));
 
@@ -167,25 +305,24 @@ public sealed class Store : IDisposable
     public StoredObject SaveObject(string library, string name, string type, string attribute, string source)
     {
         var version = DateTime.UtcNow.Ticks;
-        Run("INSERT OR REPLACE INTO QFAKE_OBJECT VALUES (@l, @n, @t, @a, @s, @v)",
+        Run($"INSERT OR REPLACE INTO {Schema(library)}.QFAKE_OBJECT VALUES (@l, @n, @t, @a, @s, @v)",
             ("@l", library), ("@n", name), ("@t", type), ("@a", attribute), ("@s", source), ("@v", version));
         return new StoredObject(library, name, type, attribute, source, version);
     }
 
     /// <summary>The object of this name and type (*PGM or *FILE). A null library matches any.</summary>
-    public StoredObject? FindObject(string? library, string name, string type) =>
-        Query("""
-            SELECT LIBRARY, NAME, TYPE, ATTRIBUTE, SOURCE, VERSION FROM QFAKE_OBJECT
-            WHERE NAME = @n AND TYPE = @t AND (@l IS NULL OR LIBRARY = @l) ORDER BY LIBRARY
-            """,
-            r => new StoredObject(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4), r.GetInt64(5)),
-            ("@n", name.ToUpperInvariant()), ("@t", type), ("@l", library?.ToUpperInvariant())).FirstOrDefault();
+    public StoredObject? FindObject(string? library, string name, string type, string? first = null) =>
+        LibrariesFor(library, first).Select(l =>
+            Query($"SELECT LIBRARY, NAME, TYPE, ATTRIBUTE, SOURCE, VERSION FROM {Schema(l)}.QFAKE_OBJECT WHERE NAME = @n AND TYPE = @t",
+                r => new StoredObject(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4), r.GetInt64(5)),
+                ("@n", name.ToUpperInvariant()), ("@t", type)).FirstOrDefault())
+            .FirstOrDefault(o => o is not null);
 
     public bool DeleteObject(StoredObject o)
     {
         lock (Gate)
         {
-            using var command = Command("DELETE FROM QFAKE_OBJECT WHERE LIBRARY = @l AND NAME = @n AND TYPE = @t",
+            using var command = Command($"DELETE FROM {Schema(o.Library)}.QFAKE_OBJECT WHERE LIBRARY = @l AND NAME = @n AND TYPE = @t",
                 [("@l", o.Library), ("@n", o.Name), ("@t", o.Type)]);
             return command.ExecuteNonQuery() > 0;
         }
@@ -195,19 +332,20 @@ public sealed class Store : IDisposable
 
     // ---- users ----
 
-    private static UserRow ReadUser(SqliteDataReader r) => new(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4));
+    private static UserRow ReadUser(SqliteDataReader r) => new(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4), r.GetString(5));
 
     /// <summary>Every user profile, by name.</summary>
     public IReadOnlyList<UserRow> UserRows() =>
-        Query("SELECT USERNAME, PASSWORD, STATUS, PWDEXP, TEXT FROM QFAKE_USER ORDER BY USERNAME", ReadUser);
+        Query("SELECT USERNAME, PASSWORD, STATUS, PWDEXP, TEXT, DFTLIB FROM QFAKE_USER ORDER BY USERNAME", ReadUser);
 
     public UserRow? FindUser(string name) =>
-        Query("SELECT USERNAME, PASSWORD, STATUS, PWDEXP, TEXT FROM QFAKE_USER WHERE USERNAME = @n", ReadUser, ("@n", name)).FirstOrDefault();
+        Query("SELECT USERNAME, PASSWORD, STATUS, PWDEXP, TEXT, DFTLIB FROM QFAKE_USER WHERE USERNAME = @n", ReadUser, ("@n", name)).FirstOrDefault();
 
     /// <summary>Adds the user, or replaces the one of that name.</summary>
     public void SaveUser(UserRow user) =>
-        Run("INSERT OR REPLACE INTO QFAKE_USER VALUES (@u, @p, @s, @e, @t)",
-            ("@u", user.User), ("@p", user.Password), ("@s", user.Status), ("@e", user.PasswordExpired), ("@t", user.Text));
+        Run("INSERT OR REPLACE INTO QFAKE_USER (USERNAME, PASSWORD, STATUS, PWDEXP, TEXT, DFTLIB) VALUES (@u, @p, @s, @e, @t, @d)",
+            ("@u", user.User), ("@p", user.Password), ("@s", user.Status), ("@e", user.PasswordExpired), ("@t", user.Text),
+            ("@d", user.DefaultLibrary));
 
     /// <summary>Keeps a user's password and flags, as signing on changes them, leaving its text.</summary>
     public void UpdateUser(string name, string password, bool disabled, bool passwordExpired) =>
@@ -237,13 +375,26 @@ public sealed class Store : IDisposable
 
     // ---- tables ----
 
-    /// <summary>A table's columns and declared types, in order; empty when there's no such table.</summary>
-    public IReadOnlyList<(string Name, string Type)> Columns(string table) =>
-        Query("SELECT name, type FROM pragma_table_info(@t)", r => (r.GetString(0), r.GetString(1)), ("@t", table.ToUpperInvariant()))
-            is { Count: > 0 } exact
-            ? exact
-            : Query("SELECT p.name, p.type FROM sqlite_master m, pragma_table_info(m.name) p WHERE upper(m.name) = @t",
-                r => (r.GetString(0), r.GetString(1)), ("@t", table.ToUpperInvariant()));
+    /// <summary>
+    /// A table's columns and declared types, in order; empty when there's no such table. A null
+    /// library looks in every library, in order.
+    /// </summary>
+    public IReadOnlyList<(string Name, string Type)> Columns(string table, string? library = null)
+    {
+        // QTEMP's tables are SQLite's temp ones, which no library holds.
+        foreach (var l in LibrariesFor(library).Append(library is null || library.Equals("QTEMP", StringComparison.OrdinalIgnoreCase) ? "QTEMP" : null).OfType<string>())
+        {
+            var schema = l == "QTEMP" ? "temp" : Schema(l);
+            var plain = schema.Trim('"');
+            var found = Query("SELECT name, type FROM pragma_table_info(@t, @s)", r => (r.GetString(0), r.GetString(1)),
+                    ("@t", table.ToUpperInvariant()), ("@s", plain)) is { Count: > 0 } exact
+                ? exact
+                : Query($"SELECT p.name, p.type FROM {schema}.sqlite_master m, pragma_table_info(m.name, @s) p WHERE upper(m.name) = @t",
+                    r => (r.GetString(0), r.GetString(1)), ("@t", table.ToUpperInvariant()), ("@s", plain));
+            if (found.Count > 0) return found;
+        }
+        return [];
+    }
 
     /// <summary>
     /// Why SQLite won't take this statement, or null when it will. Each statement of the text is
@@ -257,6 +408,8 @@ public sealed class Store : IDisposable
             {
                 using var command = _connection.CreateCommand();
                 // EXPLAIN compiles the statement without running it.
+                // A table created with no library is checked as if in QGPL.
+                sql = sql.Replace("QFAKE_DFTLIB", "main", StringComparison.Ordinal);
                 foreach (var statement in sql.Split(";\n", StringSplitOptions.RemoveEmptyEntries))
                 {
                     command.CommandText = "EXPLAIN " + statement;

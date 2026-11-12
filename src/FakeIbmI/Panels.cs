@@ -8,7 +8,8 @@ namespace FakeIbmI;
 /// <summary>What a panel wants after the user's input: another panel (or itself), or back to the main menu.</summary>
 /// <param name="Next">The panel to show; null goes back to the main menu.</param>
 /// <param name="Message">A message for the error row of whatever is shown next.</param>
-internal sealed record PanelResult(Panel? Next, string? Message = null);
+/// <param name="Command">A command to run as if typed on the main menu's command line, in place of showing a panel.</param>
+internal sealed record PanelResult(Panel? Next, string? Message = null, string? Command = null);
 
 internal abstract class Panel
 {
@@ -19,8 +20,46 @@ internal abstract class Panel
     protected static byte[] Title(string text) => Join(Sba(1, Math.Max(2, (80 - text.Length) / 2)), [Highlight], Text(text), [Normal]);
 }
 
+/// <summary>System Options: the user, library and source tools, each one choice.</summary>
+internal sealed class SystemMenuPanel(Machine machine, string defaultLibrary, Action<string> log) : Panel
+{
+    private const int SelectionRow = 12;
+    private const int Column = 20;
+
+    public override byte[] Render(string? message) => Screen5250(
+        Header(24),
+        Title("System Options"),
+        Sba(3, 2), Text("Select one of the following:"),
+        Sba(5, 5), Text("1. Work with users"),
+        Sba(6, 5), Text("2. Work with libraries"),
+        Sba(7, 5), Text("3. Work with source members"),
+        Sba(SelectionRow, 2), Text("Selection  . . ."), Sba(SelectionRow, Column - 1), Sf(0x4020, Underline, 2),
+        Sba(22, 2), [Normal], Text("F3=Exit   F12=Cancel"),
+        Message(message));
+
+    public override PanelResult Handle(ReceivedInput input)
+    {
+        if (input.Aid is F3Aid or F12Aid) return new PanelResult(null);
+        if (input.Aid != EnterAid) return new PanelResult(this, "Function key not allowed.");
+        switch (input.FieldAt(SelectionRow, Column)?.Trim() ?? "")
+        {
+            case "":
+                return new PanelResult(this);
+            case "1":
+                // The user maintenance program, a program of the fake's own like any other.
+                return new PanelResult(null, Command: "CALL USRMNT");
+            case "2":
+                return new PanelResult(new LibraryListPanel(machine, defaultLibrary, log, this));
+            case "3":
+                return new PanelResult(new MemberListPanel(machine, defaultLibrary, log, this));
+            case var other:
+                return new PanelResult(this, $"Option {other} isn't 1, 2 or 3.");
+        }
+    }
+}
+
 /// <summary>Work with Members: every member, with options to edit, delete, show diagnostics and compile.</summary>
-internal sealed class MemberListPanel(Machine machine, Action<string> log) : Panel
+internal sealed class MemberListPanel(Machine machine, string defaultLibrary, Action<string> log, Panel? back = null) : Panel
 {
     private const int FirstRow = 7;
     private const int PageSize = 12;
@@ -59,10 +98,12 @@ internal sealed class MemberListPanel(Machine machine, Action<string> log) : Pan
         var members = machine.Store.Members();
         switch (input.Aid)
         {
-            case F3Aid or F12Aid:
+            case F3Aid:
                 return new PanelResult(null);
+            case F12Aid:
+                return new PanelResult(back);
             case F6Aid:
-                return new PanelResult(new NewMemberPanel(machine, this, log));
+                return new PanelResult(new NewMemberPanel(machine, defaultLibrary, this, log));
             case RollUpAid:
                 if (_top + PageSize >= members.Count) return new PanelResult(this, "Already at the bottom of the list.");
                 _top += PageSize;
@@ -103,8 +144,136 @@ internal sealed class MemberListPanel(Machine machine, Action<string> log) : Pan
     }
 }
 
+/// <summary>Work with Libraries: every library with what it holds, and options to delete one; F6 makes one.</summary>
+internal sealed class LibraryListPanel(Machine machine, string defaultLibrary, Action<string> log, Panel? back = null) : Panel
+{
+    private const int FirstRow = 7;
+    private const int PageSize = 12;
+    private int _top;
+
+    public override byte[] Render(string? message)
+    {
+        var libraries = machine.Store.Libraries();
+        _top = Math.Clamp(_top, 0, Math.Max(0, (libraries.Count - 1) / PageSize * PageSize));
+        var rows = new List<byte[]>();
+        for (var i = 0; i < PageSize && _top + i < libraries.Count; i++)
+        {
+            var library = libraries[_top + i];
+            var (members, objects, tables) = machine.Store.Counts(library);
+            var row = FirstRow + i;
+            rows.Add(Join(
+                Sba(row, 2), Sf(0x4000, Underline, 2),
+                Sba(row, 5), [Normal],
+                Text($" {library,-10}  {members,7}  {objects,7}  {tables,6}  {(library == defaultLibrary ? "Your default library" : library == machine.CurrentLibrary ? "System library" : "")}")));
+        }
+        return Screen5250(
+            Header(24),
+            Title("Work with Libraries"),
+            Sba(3, 2), Text("Type options, press Enter."),
+            Sba(4, 4), Text("4=Delete"),
+            Sba(6, 1), [Highlight], Text("Opt  Library     Members  Objects  Tables"), [Normal],
+            Join([.. rows]),
+            Sba(FirstRow + PageSize, 70), Text(_top + PageSize >= libraries.Count ? "Bottom" : "More..."),
+            Sba(22, 2), Text("F3=Exit   F6=Create   F12=Cancel"),
+            Message(message));
+    }
+
+    public override PanelResult Handle(ReceivedInput input)
+    {
+        var libraries = machine.Store.Libraries();
+        switch (input.Aid)
+        {
+            case F3Aid:
+                return new PanelResult(null);
+            case F12Aid:
+                return new PanelResult(back);
+            case F6Aid:
+                return new PanelResult(new NewLibraryPanel(machine, this, log));
+            case RollUpAid:
+                if (_top + PageSize >= libraries.Count) return new PanelResult(this, "Already at the bottom of the list.");
+                _top += PageSize;
+                return new PanelResult(this);
+            case RollDownAid:
+                if (_top == 0) return new PanelResult(this, "Already at the top of the list.");
+                _top -= PageSize;
+                return new PanelResult(this);
+            case not EnterAid:
+                return new PanelResult(this, "Function key not allowed.");
+        }
+        for (var i = 0; i < PageSize && _top + i < libraries.Count; i++)
+        {
+            var option = input.FieldAt(FirstRow + i, 3)?.Trim() ?? "";
+            if (option.Length == 0) continue;
+            var library = libraries[_top + i];
+            if (option != "4") return new PanelResult(this, $"Option {option} isn't 4.");
+            if (library == machine.CurrentLibrary) return new PanelResult(this, $"Library {library} can't be deleted: it holds the system's tables.");
+            return new PanelResult(new DeleteLibraryPanel(machine, library, this, log));
+        }
+        return new PanelResult(this);
+    }
+}
+
+/// <summary>Option 4 on the library list: asks to confirm, as what's in the library goes with it.</summary>
+internal sealed class DeleteLibraryPanel(Machine machine, string library, Panel back, Action<string> log) : Panel
+{
+    public override byte[] Render(string? message)
+    {
+        var (members, objects, tables) = machine.Store.Counts(library);
+        return Screen5250(
+            Header(24),
+            Title("Confirm Delete of Library"),
+            Sba(4, 2), Text($"Library {library} has {members} source member{(members == 1 ? "" : "s")}, {objects} object{(objects == 1 ? "" : "s")} and {tables} table{(tables == 1 ? "" : "s")}."),
+            Sba(5, 2), Text("They are all deleted with it, and its database file too."),
+            Sba(7, 2), Text("Press Enter to confirm the delete."),
+            Sba(22, 2), Text("Enter=Delete   F12=Cancel"),
+            Message(message));
+    }
+
+    public override PanelResult Handle(ReceivedInput input)
+    {
+        switch (input.Aid)
+        {
+            case F12Aid or F3Aid:
+                return new PanelResult(back);
+            case EnterAid:
+                var result = machine.Run($"DLTLIB LIB({library})", new BatchJob("QUSER", CancellationToken.None));
+                log($"library {library} deleted");
+                return new PanelResult(back, result.Message);
+            default:
+                return new PanelResult(this, "Function key not allowed.");
+        }
+    }
+}
+
+/// <summary>F6 on the library list: names a new library.</summary>
+internal sealed class NewLibraryPanel(Machine machine, Panel back, Action<string> log) : Panel
+{
+    private const int Column = 30;
+
+    public override byte[] Render(string? message) => Screen5250(
+        Header(24),
+        Title("Create Library"),
+        Sba(3, 2), Text("Type choices, press Enter."),
+        Sba(6, 4), Text("Library . . . . . . ."), Sba(6, Column - 1), Sf(0x4020, Underline, 10),
+        Sba(6, 43), [Normal], Text("1 to 10 letters, digits, # $ @ _"),
+        Sba(22, 2), Text("F3=Exit   F12=Cancel"),
+        Message(message));
+
+    public override PanelResult Handle(ReceivedInput input)
+    {
+        if (input.Aid is F12Aid or F3Aid) return new PanelResult(back);
+        if (input.Aid != EnterAid) return new PanelResult(this, "Function key not allowed.");
+        var name = input.FieldAt(6, Column)?.Trim().ToUpperInvariant() ?? "";
+        if (name.Length == 0) return new PanelResult(this, "Library name required.");
+        var result = machine.Run($"CRTLIB LIB({name})", new BatchJob("QUSER", CancellationToken.None));
+        if (!result.Ok) return new PanelResult(this, result.Message);
+        log($"library {name} created");
+        return new PanelResult(back, result.Message);
+    }
+}
+
 /// <summary>F6 on the list: names a new member, then edits it.</summary>
-internal sealed class NewMemberPanel(Machine machine, Panel back, Action<string> log) : Panel
+internal sealed class NewMemberPanel(Machine machine, string defaultLibrary, Panel back, Action<string> log) : Panel
 {
     private const int Column = 30;
 
@@ -117,7 +286,7 @@ internal sealed class NewMemberPanel(Machine machine, Panel back, Action<string>
         Sba(8, 44), [Normal], Text("RPGLE, SQLRPGLE, DSPF, SQL"),
         Sba(10, 4), Text("Source file  . . . . ."), Sba(10, Column - 1), Sf(0x4020, Underline, 10),
         Sba(10, 44), [Normal], Text("Blank: the type's usual file"),
-        Sba(12, 4), Text("Library  . . . . . . ."), Sba(12, Column - 1), Sf(0x4020, Underline, 10), Text(machine.CurrentLibrary),
+        Sba(12, 4), Text("Library  . . . . . . ."), Sba(12, Column - 1), Sf(0x4020, Underline, 10), Text(defaultLibrary),
         Sba(22, 2), Text("F3=Exit   F12=Cancel"),
         Message(message));
 
@@ -129,13 +298,14 @@ internal sealed class NewMemberPanel(Machine machine, Panel back, Action<string>
         var name = Field(6, "");
         var type = Field(8, "RPGLE");
         var file = Field(10, Machine.DefaultFile(type));
-        var library = Field(12, machine.CurrentLibrary);
+        var library = Field(12, defaultLibrary);
         if (name.Length == 0) return new PanelResult(this, "Member name required.");
         foreach (var value in new[] { name, file, library })
         {
             if (!Machine.IsName(value)) return new PanelResult(this, $"{value} isn't a name: up to 10 letters and digits, starting with a letter.");
         }
         if (Machine.TypeForExtension(type) is null) return new PanelResult(this, $"Source type {type} isn't supported: RPGLE, SQLRPGLE, DSPF or SQL.");
+        if (!machine.Store.HasLibrary(library)) return new PanelResult(this, $"Library {library} not found.");
         if (machine.Store.FindMember(library, file, name) is not null) return new PanelResult(this, $"Member {name} already exists in {library}/{file}.");
         return new PanelResult(new EditorPanel(machine, new Member(library, file, name, type, type is "RPGLE" or "SQLRPGLE" ? "**FREE" : ""), back, log));
     }

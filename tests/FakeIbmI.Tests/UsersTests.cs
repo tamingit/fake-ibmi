@@ -133,12 +133,18 @@ public class UsersTests
         store.SaveUser(new UserRow("EXTRA", "Extra123", "*ENABLED", "*NO", "Added"));
         Assert.Equal(SignOnResult.SignedOn, users.Check("EXTRA", "Extra123").Result);
 
+        // A default library is kept through the next start too.
+        Assert.Equal("QGPL", users.Find("PRTUSER")!.DefaultLibrary);
+        store.CreateLibrary("SALES");
+        store.SaveUser(store.FindUser("PRTUSER")! with { DefaultLibrary = "SALES" });
+
         // The next start sets the three the settings name again, and leaves the rest.
         users = Users.Open(store, new Dictionary<string, string> { ["FAKE_IBMI_PASSWORD"] = "Changed1" });
         Assert.Equal(SignOnResult.PasswordExpired, users.Check("EXPUSER", "Expired1").Result);
         Assert.Equal(SignOnResult.SignedOn, users.Check("PRTUSER", "Changed1").Result);
         Assert.Equal(SignOnResult.SignedOn, users.Check("EXTRA", "Extra123").Result);
         Assert.Equal("Added", store.FindUser("EXTRA")!.Text);
+        Assert.Equal("SALES", users.Find("PRTUSER")!.DefaultLibrary);
 
         // Deleting one takes it away from every server at once.
         using (var command = store.Connection.CreateCommand())
@@ -148,5 +154,33 @@ public class UsersTests
         }
         Assert.Equal(SignOnResult.UnknownUser, users.Check("EXTRA", "Extra123").Result);
         Assert.Equal("PRTUSER", users.Main.User);
+    }
+
+    [Fact]
+    public void ADatabaseFromBeforeDefaultLibrariesGetsTheColumn()
+    {
+        var folder = Directory.CreateTempSubdirectory("fake-ibmi-old").FullName;
+        try
+        {
+            using (var store = Store.Open(folder))
+            {
+                using var command = store.Connection.CreateCommand();
+                command.CommandText = """
+                    DROP TABLE QFAKE_USER;
+                    CREATE TABLE QFAKE_USER (USERNAME TEXT NOT NULL PRIMARY KEY, PASSWORD TEXT NOT NULL,
+                        STATUS TEXT NOT NULL DEFAULT '*ENABLED', PWDEXP TEXT NOT NULL DEFAULT '*NO', TEXT TEXT NOT NULL DEFAULT '');
+                    INSERT INTO QFAKE_USER VALUES ('OLDER', 'Old12345', '*ENABLED', '*NO', 'From before');
+                    """;
+                command.ExecuteNonQuery();
+            }
+
+            using var again = Store.Open(folder);
+            Assert.Equal("QGPL", again.FindUser("OLDER")!.DefaultLibrary);
+            Assert.Equal("From before", again.FindUser("OLDER")!.Text);
+        }
+        finally
+        {
+            Directory.Delete(folder, recursive: true);
+        }
     }
 }

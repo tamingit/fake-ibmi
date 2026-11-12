@@ -699,6 +699,11 @@ public sealed class TelnetServer : IAsyncDisposable
         if (screen == Screen.Panel && session.Panel is { } panel)
         {
             var result = panel.Handle(input);
+            if (result.Command is { } command)
+            {
+                session.Panel = null;
+                return Command(command, session);
+            }
             session.Panel = result.Next;
             return (result.Next is null ? Screen.Main : Screen.Panel, result.Message);
         }
@@ -728,8 +733,8 @@ public sealed class TelnetServer : IAsyncDisposable
             }
             if (text == "5")
             {
-                Log("main menu: members");
-                session.Panel = new MemberListPanel(_machine, Log);
+                Log("main menu: system options");
+                session.Panel = new SystemMenuPanel(_machine, _machine.DefaultLibrary(session.User), Log);
                 return (Screen.Panel, null);
             }
             if (text.Length > 0 && text.All(char.IsAsciiDigit))
@@ -743,7 +748,7 @@ public sealed class TelnetServer : IAsyncDisposable
     }
 
     /// <summary>
-    /// A command typed on the main menu's command line. WRKMBRPDM and STRSEU open the source
+    /// A command typed on the main menu's command line. WRKMBRPDM, WRKLIB, WRKUSRPRF and STRSEU open the
     /// screens; CALL runs its program as this session's job; the machine runs the rest. Only the
     /// command's name is logged: its parameters can hold anything.
     /// </summary>
@@ -761,22 +766,29 @@ public sealed class TelnetServer : IAsyncDisposable
         Log($"command {command.Name} by {session.User}");
         switch (command.Name)
         {
+            case "WRKLIB":
+                session.Panel = new LibraryListPanel(_machine, _machine.DefaultLibrary(session.User), Log);
+                return (Screen.Panel, null);
+            case "WRKUSRPRF":
+                // The user maintenance program.
+                return Command("CALL USRMNT", session);
             case "WRKMBRPDM":
-                session.Panel = new MemberListPanel(_machine, Log);
+                session.Panel = new MemberListPanel(_machine, _machine.DefaultLibrary(session.User), Log);
                 return (Screen.Panel, null);
             case "STRSEU":
             {
                 if (command.Value("SRCMBR", 1)?.ToUpperInvariant() is not { } name) return (Screen.Main, "Parameter SRCMBR required.");
                 var (library, file) = command.Value("SRCFILE", 0) is { } f ? Machine.Qualified(f) : (null, null);
-                var list = new MemberListPanel(_machine, Log);
-                var member = _machine.Store.FindMember(library, file, name);
+                var list = new MemberListPanel(_machine, _machine.DefaultLibrary(session.User), Log);
+                var member = _machine.Store.FindMember(library, file, name, _machine.DefaultLibrary(session.User));
                 if (member is null)
                 {
                     // A new member, of the type given (RPGLE without one).
                     var type = command.Value("TYPE", 2)?.ToUpperInvariant() ?? "RPGLE";
                     if (!Machine.IsName(name) || Machine.TypeForExtension(type) is null || file is not null && !Machine.IsName(file))
                         return (Screen.Main, $"Member {name} can't be created: check its name, file and type (RPGLE, SQLRPGLE, DSPF, SQL).");
-                    member = new Member(library ?? _machine.CurrentLibrary, file ?? Machine.DefaultFile(type), name, type, type is "RPGLE" or "SQLRPGLE" ? "**FREE" : "");
+                    if (library is not null && !_machine.Store.HasLibrary(library)) return (Screen.Main, $"Library {library} not found.");
+                    member = new Member(library ?? _machine.DefaultLibrary(session.User), file ?? Machine.DefaultFile(type), name, type, type is "RPGLE" or "SQLRPGLE" ? "**FREE" : "");
                 }
                 session.Panel = new EditorPanel(_machine, member, list, Log);
                 return (Screen.Panel, null);
@@ -888,7 +900,7 @@ public sealed class TelnetServer : IAsyncDisposable
             Sba(9, 5),
             Text("4. Placeholder list (3 pages)"),
             Sba(12, 5),
-            Text("5. Work with source members"),
+            Text("5. System options (users, libraries, source)"),
             Sba(10, 4),
             Text("90. Sign off"),
             Sba(11, 3),

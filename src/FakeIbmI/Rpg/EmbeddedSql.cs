@@ -231,7 +231,7 @@ internal sealed partial class Interpreter
     private SqliteCommand Command(SqlTranslation sql, Frame frame, IReadOnlyList<string> usingNames)
     {
         var command = _machine.Store.Connection.CreateCommand();
-        var text = sql.Sql!;
+        var text = _machine.Resolve(sql.Sql!, _host.User);
         var markers = 0;
         for (var i = 0; i < sql.Inputs.Count; i++)
         {

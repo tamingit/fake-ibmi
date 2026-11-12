@@ -156,6 +156,9 @@ public class RemoteCommandServerTests
             return BinaryPrimitives.ReadUInt16BigEndian(reply.AsSpan(20));
         }
 
+        Assert.Equal(0x0400, await RunAsync("RUNSQL SQL('create table mylib/t (a int)') COMMIT(*NONE)"));
+        Assert.Equal(0, await RunAsync("CRTLIB LIB(MYLIB)"));
+        Assert.Equal(0x0400, await RunAsync("CRTLIB LIB(MYLIB)"));
         Assert.Equal(0, await RunAsync("RUNSQL SQL('create table mylib/t (a int)') COMMIT(*NONE)"));
         Assert.Equal(0x0400, await RunAsync("RUNSQL SQL('create table mylib/t (a int)') COMMIT(*NONE)"));
         Assert.Equal(0, await RunAsync("CALL PGM(QGPL/ADDER) PARM(1 2 0 'Ada' 0)"));

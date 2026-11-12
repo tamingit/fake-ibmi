@@ -1,6 +1,8 @@
 **FREE
-// CALL USRMNT: user maintenance. Lists the users in the table QFAKE_USER, where the servers (the
-// 5250 sign-on, the sign-on server, Network Print and the remote command server) check sign-ons.
+// CALL USRMNT: user maintenance (System Options on the main menu, option 1). Lists the users in the table
+// QFAKE_USER, where the servers (the 5250 sign-on, the sign-on server, Network Print and the remote
+// command server) check sign-ons. A user's default library (DFTLIB) is the one its names are looked
+// for in first, and where its new source and SQL tables go; QFAKE_LIBRARY lists the libraries there are.
 // F6 creates a user, 2 changes one and 4 deletes one. A change holds at the next sign-on.
 // The fake keeps passwords as typed, so that every server can check them: don't use real ones.
 dcl-f usrmntd workstn sfile(row:rrn);
@@ -40,14 +42,15 @@ dcl-proc load;
   write list;
   rrn = 0;
   exec sql declare found cursor for
-    select username, status, pwdexp, text from qfake_user order by username for read only;
+    select username, status, pwdexp, text, dftlib from qfake_user order by username for read only;
   exec sql open found;
-  exec sql fetch next from found into :uname, :ustatus, :upwdexp, :utext;
+  exec sql fetch next from found into :uname, :ustatus, :upwdexp, :utext, :udftlib;
   dow sqlcode = 0;
     rrn += 1;
     opt = ' ';
+    udesc = utext;
     write row;
-    exec sql fetch next from found into :uname, :ustatus, :upwdexp, :utext;
+    exec sql fetch next from found into :uname, :ustatus, :upwdexp, :utext, :udftlib;
   enddo;
   exec sql close found;
   *in40 = (rrn > 0);
@@ -61,6 +64,7 @@ dcl-proc create;
   ustatus = '*ENABLED';
   upwdexp = '*NO';
   utext = ' ';
+  udftlib = 'QGPL';
   clearerrors();
   dou not invalid(*on);
     exfmt newuser;
@@ -69,8 +73,8 @@ dcl-proc create;
       return;
     endif;
   enddo;
-  exec sql insert into qfake_user (username, password, status, pwdexp, text)
-    values (:uname, :upwd, :ustatus, :upwdexp, :utext);
+  exec sql insert into qfake_user (username, password, status, pwdexp, text, dftlib)
+    values (:uname, :upwd, :ustatus, :upwdexp, :utext, :udftlib);
   if sqlcode = 0;
     msg = 'User ' + %trim(uname) + ' created.';
   else;
@@ -82,7 +86,7 @@ end-proc;
 dcl-proc change;
   dcl-s wanted char(10);
   wanted = uname;
-  exec sql select status, pwdexp, text into :ustatus, :upwdexp, :utext
+  exec sql select status, pwdexp, text, dftlib into :ustatus, :upwdexp, :utext, :udftlib
     from qfake_user where username = :wanted;
   if sqlcode <> 0;
     msg = 'User ' + %trim(wanted) + ' was not found.';
@@ -100,10 +104,10 @@ dcl-proc change;
     endif;
   enddo;
   if upwd = *blanks;
-    exec sql update qfake_user set status = :ustatus, pwdexp = :upwdexp, text = :utext
+    exec sql update qfake_user set status = :ustatus, pwdexp = :upwdexp, text = :utext, dftlib = :udftlib
       where username = :wanted;
   else;
-    exec sql update qfake_user set password = :upwd, status = :ustatus, pwdexp = :upwdexp, text = :utext
+    exec sql update qfake_user set password = :upwd, status = :ustatus, pwdexp = :upwdexp, text = :utext, dftlib = :udftlib
       where username = :wanted;
   endif;
   if sqlcode = 0;
@@ -139,10 +143,11 @@ dcl-proc clearerrors;
   *in53 = *off;
   *in54 = *off;
   *in55 = *off;
+  *in56 = *off;
 end-proc;
 
 // Sets the error indicators (50 name, 51 exists, 52 password needed, 53 passwords differ, 54 status,
-// 55 password expired) for what was typed. Returns whether any is on.
+// 55 password expired, 56 library) for what was typed. Returns whether any is on.
 dcl-proc invalid;
   dcl-pi *n ind;
     creating ind const;
@@ -153,6 +158,12 @@ dcl-proc invalid;
   clearerrors();
   ustatus = %upper(ustatus);
   upwdexp = %upper(upwdexp);
+  udftlib = %upper(udftlib);
+  if udftlib = *blanks;
+    udftlib = 'QGPL';
+  endif;
+  exec sql select count(*) into :count from qfake_library where name = :udftlib;
+  *in56 = (count = 0);
   if creating;
     uname = %upper(uname);
     *in50 = (uname = *blanks
@@ -167,5 +178,5 @@ dcl-proc invalid;
   *in53 = (upwd <> upwd2);
   *in54 = (ustatus <> '*ENABLED' and ustatus <> '*DISABLED');
   *in55 = (upwdexp <> '*YES' and upwdexp <> '*NO');
-  return *in50 or *in51 or *in52 or *in53 or *in54 or *in55;
+  return *in50 or *in51 or *in52 or *in53 or *in54 or *in55 or *in56;
 end-proc;

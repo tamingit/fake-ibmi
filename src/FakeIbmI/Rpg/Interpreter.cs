@@ -266,7 +266,9 @@ internal sealed partial class Interpreter
                 var fields = new List<DsField>();
                 if (spec.ExtName is { } table)
                 {
-                    var columns = _machine.Store.Columns(table);
+                    // EXTNAME('LIB/TABLE') or ('LIB.TABLE') names the library too.
+                    var named = table.ToUpperInvariant().Split('/', '.');
+                    var columns = named.Length == 2 ? _machine.Store.Columns(named[1], named[0]) : _machine.Store.Columns(table);
                     if (columns.Count == 0) throw new RpgError(100, $"EXTNAME({table}): there's no such table");
                     fields.AddRange(columns.Select(c => new DsField(c.Name.ToUpperInvariant(), SqlType(c.Type), null, 0)));
                 }
@@ -775,7 +777,7 @@ internal sealed partial class Interpreter
     private void OpenDisplay(FileDecl file)
     {
         _line = file.Line;
-        var definition = _machine.LoadDisplayFile(file.Name) ?? throw new RpgError(1211, $"display file {file.Name} doesn't exist: create it first with CRTDSPF");
+        var definition = _machine.LoadDisplayFile(file.Name, _host.User) ?? throw new RpgError(1211, $"display file {file.Name} doesn't exist: create it first with CRTDSPF");
         // Each named field is a variable of the program, unless the program declares it.
         foreach (var field in definition.Records.Values.SelectMany(r => r.Fields).Where(f => f.Name is not null))
         {

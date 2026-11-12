@@ -13,3 +13,6 @@ TestResults/
 
 # local settings, such as the users (.env.example is the template)
 .env
+
+# The libraries' SQLite databases (FAKE_IBMI_DATABASE_DIR in .env.example)
+/data/

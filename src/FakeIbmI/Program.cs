@@ -14,10 +14,12 @@
 //     FAKE_IBMI_USER / FAKE_IBMI_PASSWORD set the user every server signs on, and
 //     FAKE_IBMI_EXPIRED_USER / _PASSWORD and FAKE_IBMI_LOCKED_USER / _PASSWORD the user whose
 //     password has expired and the disabled one. See .env.example.
-// --database names the SQLite file that keeps source members, programs, display files and the
-//     tables embedded SQL works on (default: in memory, gone when the fake stops).
-// --source-dir reads a folder of source (.rpgle, .sqlrpgle, .dspf, .sql) at start-up: each member that's
-//     new or changed is saved, checked and created, and what the fake can't run is logged by line.
+// --database-dir names the folder of the libraries' SQLite databases (QGPL.db, MYLIB.db ...), which keep source
+//     members, programs, display files and the tables embedded SQL works on (default: in memory, gone when the fake stops).
+//     QGPL's also keeps the users and the spooled files.
+// --source-dir reads a folder of source at start-up, with a folder for each library (MYLIB/QRPGLESRC/prog.rpgle;
+//     files directly in it go to QGPL): each member that's new or changed is saved, checked and created
+//     (.rpgle, .sqlrpgle, .dspf, .sql), and what the fake can't run is logged by line.
 // --check does that without creating anything or starting a server; exit code 3 when something isn't supported.
 // --bind listens on another address than loopback (0.0.0.0: every interface).
 // --trace logs each Telnet negotiation step, and each record's length (never its contents).
@@ -35,7 +37,7 @@ try
     var settings = Settings.Load(envFile, Environment.GetEnvironmentVariables());
     var options = Options.Parse(args, settings);
     if (options.SourceDir is not null && !Directory.Exists(options.SourceDir))
-        throw new ArgumentException($"--source-dir {options.SourceDir} doesn't exist");
+        throw new ArgumentException($"the source folder {options.SourceDir} doesn't exist (--source-dir, or FAKE_IBMI_SOURCE_DIR in the settings)");
     if (options.Check)
     {
         using var scratch = Machine.Open();
@@ -44,9 +46,10 @@ try
         return unsupported == 0 ? 0 : 3;
     }
     // Every server works on the same source, programs and tables.
-    using var machine = Machine.Open(options.Database);
-    Console.WriteLine($"database: {options.Database ?? "in memory (--database keeps it in a file)"}");
+    using var machine = Machine.Open(options.DatabaseDir);
+    Console.WriteLine($"libraries: {string.Join(", ", machine.Store.Libraries())} ({(options.DatabaseDir is null ? "in memory: --database-dir keeps them in files" : $"databases in {options.DatabaseDir}")})");
     // Every server checks sign-ons against the same users, kept in the database, so a password changed through one holds for all.
+    machine.InstallSystemSource(Log);
     var users = Users.Open(machine.Store, settings);
     Console.WriteLine($"users{(envFile is null ? "" : $" (settings from {envFile})")}: {string.Join(", ", users.All)}");
     if (options.SourceDir is not null) machine.Import(options.SourceDir, Log);
@@ -101,6 +104,12 @@ try
 }
 catch (ArgumentException e)
 {
+    Console.Error.WriteLine($"fake IBM i: {e.Message}");
+    return 2;
+}
+catch (InvalidOperationException e)
+{
+    // Too many libraries in the database folder.
     Console.Error.WriteLine($"fake IBM i: {e.Message}");
     return 2;
 }
