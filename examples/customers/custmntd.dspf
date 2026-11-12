@@ -1,0 +1,79 @@
+     A* Customer maintenance: menu, list/search, lookup by number, new customer, detail.
+     A                                      DSPSIZ(24 80 *DS3)
+     A                                      CA03(03 'Exit')
+     A                                      CA12(12 'Cancel')
+     A          R MENU
+     A                                  1 30'Customer Maintenance'
+     A                                      DSPATR(HI)
+     A                                  5  5'1. List or search customers'
+     A                                  6  5'2. Look up a customer by number'
+     A                                  7  5'3. Create a new customer'
+     A                                  8  5'4. Print a customer record'
+     A                                 12  2'Selection  . . .'
+     A            CHOICE         1A  B 12 20
+     A            MSG           50A  O 21  2
+     A                                      DSPATR(HI)
+     A                                 23  2'F3=Exit'
+     A          R ROW                       SFL
+     A            OPT            1A  B  7  3
+     A            ID             5Y 0O  7  7EDTCDE(Z)
+     A            NAME          30A  O  7 14
+     A            CITY          20A  O  7 46
+     A            BALANCE        7Y 2O  7 70EDTCDE(J)
+     A          R LIST                      SFLCTL(ROW)
+     A                                      SFLSIZ(200) SFLPAG(12)
+     A                                      OVERLAY
+     A  40                                  SFLDSP
+     A                                      SFLDSPCTL
+     A N40                                  SFLCLR
+     A  40                                  SFLEND(*MORE)
+     A                                  1 36'Customers'
+     A                                      DSPATR(HI)
+     A                                  4  2'Search name . .'
+     A            FILTER        20A  B  4 18
+     A                                  5  2'Type a name (or part of one) and press Enter. 5=Display  6=Print'
+     A                                  6  2'Opt  Id     Name                            City                 Balance'
+     A                                      DSPATR(HI)
+     A          R KEYS
+     A                                 23  2'Enter=Search   F3=Exit   F12=Menu'
+     A            MSG           50A  O 21  2
+     A                                      DSPATR(HI)
+     A          R LOOKUP
+     A            TITLE         30A  O  1 28
+     A                                      DSPATR(HI)
+     A                                  5  2'Customer number'
+     A            LKID           5Y 0B  5 20EDTCDE(Z)
+     A  52                                  ERRMSG('Customer not found' 52)
+     A                                 23  2'Enter=Look up   F12=Menu'
+     A          R NEWCUST
+     A                                  1 34'New Customer'
+     A                                      DSPATR(HI)
+     A                                  5  2'Name  . . . . .'
+     A            NAME          30A  B  5 20
+     A                                      CHECK(LC)
+     A  50                                  ERRMSG('Name required' 50)
+     A                                  6  2'City  . . . . .'
+     A            CITY          20A  B  6 20
+     A                                      CHECK(LC)
+     A                                  7  2'Email . . . . .'
+     A            EMAIL         30A  B  7 20
+     A                                      CHECK(LC)
+     A                                  8  2'Phone . . . . .'
+     A            PHONE         12A  B  8 20
+     A                                 23  2'Enter=Save   F12=Menu'
+     A          R DETAIL
+     A                                  1 36'Customer'
+     A                                      DSPATR(HI)
+     A                                  4  2'Number  . . .'
+     A            ID             5Y 0O  4 18EDTCDE(Z)
+     A                                  5  2'Name  . . . .'
+     A            NAME          30A  O  5 18
+     A                                  6  2'City  . . . .'
+     A            CITY          20A  O  6 18
+     A                                  7  2'Email . . . .'
+     A            EMAIL         30A  O  7 18
+     A                                  8  2'Phone . . . .'
+     A            PHONE         12A  O  8 18
+     A                                  9  2'Balance . . .'
+     A            BALANCE        7Y 2O  9 18EDTCDE(J)
+     A                                 23  2'Enter=Continue'

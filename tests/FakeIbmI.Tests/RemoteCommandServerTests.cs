@@ -78,6 +78,103 @@ public class RemoteCommandServerTests
         Assert.Equal(["PGM QSYS/QLZAREQ"], server.Calls);
     }
 
+    /// <summary>A machine with program ADDER: two packed inputs, their sum out, and a name it greets in place.</summary>
+    private static Machine MachineWithAdder()
+    {
+        var machine = Machine.Open();
+        var member = new Member("QGPL", "QRPGLESRC", "ADDER", "RPGLE", """
+            **FREE
+            dcl-pi *n;
+              a packed(5:0) const;
+              b packed(7:2) const;
+              sum packed(9:2);
+              name char(12);
+              count int(10);
+            end-pi;
+            sum = a + b;
+            name = 'Hi ' + %trim(name);
+            count += 1;
+            if a = 999;
+              sum = sum / (a - 999);
+            endif;
+            dsply 'added';
+            return;
+            """);
+        machine.Save(member);
+        Assert.True(machine.Compile(member).Ok);
+        return machine;
+    }
+
+    [Fact]
+    public async Task AProgramTheMachineHasReallyRunsAndReturnsItsParameters()
+    {
+        using var machine = MachineWithAdder();
+        var lines = new List<string>();
+        await using var server = await RemoteCommandServer.StartAsync(machine: machine, log: line => { lock (lines) lines.Add(line); });
+        await using var client = await Client.SignOnAsync(server.Port, "PRTUSER", "Secret12");
+
+        // Packed 5,0 = 40; packed 7,2 = -2.50; the sum out; a name in and out; a 4-byte integer in and out.
+        var reply = await client.CallAsync("ADDER", "QGPL",
+            (3, 11, [0x00, 0x04, 0x0F]), (4, 11, [0x00, 0x00, 0x25, 0x0D]), (5, 22, []),
+            (12, 33, Ebcdic.Encode("Ada")), (4, 33, [0, 0, 0, 41]));
+
+        Assert.Equal(0, BinaryPrimitives.ReadUInt16BigEndian(reply.AsSpan(20)));
+        var outputs = Parameters(reply);
+        Assert.Equal(3, outputs.Count);
+        Assert.Equal([0x00, 0x00, 0x03, 0x75, 0x0F], outputs[0].Data); // 37.50
+        Assert.Equal("Hi Ada      ", Ebcdic.Decode(outputs[1].Data));
+        Assert.Equal([0, 0, 0, 42], outputs[2].Data);
+        lock (lines) Assert.Contains(lines, l => l.Contains("call QGPL/ADDER (5 parameters): ran"));
+    }
+
+    [Fact]
+    public async Task AProgramThatFailsAnswersAnErrorAndTheLogSaysWhy()
+    {
+        using var machine = MachineWithAdder();
+        var lines = new List<string>();
+        await using var server = await RemoteCommandServer.StartAsync(machine: machine, log: line => { lock (lines) lines.Add(line); });
+        await using var client = await Client.SignOnAsync(server.Port, "PRTUSER", "Secret12");
+
+        var reply = await client.CallAsync("ADDER", "*LIBL",
+            (3, 11, [0x00, 0x99, 0x9F]), (4, 11, [0x00, 0x00, 0x00, 0x0F]), (5, 22, []), (12, 33, []), (4, 33, []));
+
+        Assert.Equal(0x0500, BinaryPrimitives.ReadUInt16BigEndian(reply.AsSpan(20)));
+        Assert.Empty(Parameters(reply));
+        lock (lines) Assert.Contains(lines, l => l.Contains("failed: ADDER ended in error at line 13: Attempt to divide by zero. (status 00102)"));
+    }
+
+    [Fact]
+    public async Task TheMachinesCommandsRunAndOthersStillSucceedUnrun()
+    {
+        using var machine = MachineWithAdder();
+        var lines = new List<string>();
+        await using var server = await RemoteCommandServer.StartAsync(machine: machine, log: line => { lock (lines) lines.Add(line); });
+        await using var client = await Client.SignOnAsync(server.Port, "PRTUSER", "Secret12");
+        async Task<int> RunAsync(string command)
+        {
+            var reply = await client.RequestAsync(0x1002, [5], (0x1104, [0, 0, 0x04, 0xB0, .. Encoding.BigEndianUnicode.GetBytes(command)]));
+            return BinaryPrimitives.ReadUInt16BigEndian(reply.AsSpan(20));
+        }
+
+        Assert.Equal(0, await RunAsync("RUNSQL SQL('create table mylib/t (a int)') COMMIT(*NONE)"));
+        Assert.Equal(0x0400, await RunAsync("RUNSQL SQL('create table mylib/t (a int)') COMMIT(*NONE)"));
+        Assert.Equal(0, await RunAsync("CALL PGM(QGPL/ADDER) PARM(1 2 0 'Ada' 0)"));
+        Assert.Equal(0x0400, await RunAsync("CALL PGM(ADDER) PARM(1 2 3 4 5 6)"));
+        Assert.Equal(0x0400, await RunAsync("CRTBNDRPG PGM(QGPL/NOSRC)"));
+        // Not the machine's: an IBM program, and a command it doesn't have.
+        Assert.Equal(0, await RunAsync("CALL PGM(QSYS/QCMDEXC) PARM('x' 1)"));
+        Assert.Equal(0, await RunAsync("CHGJOB CCSID(37)"));
+
+        Assert.Single(machine.Store.Columns("T"));
+        lock (lines)
+        {
+            Assert.Contains(lines, l => l.Contains("command CALL: ran (DSPLY showed 1 message)"));
+            Assert.Contains(lines, l => l.Contains("command CALL: failed: ADDER takes 5 parameters, not 6"));
+            Assert.Contains(lines, l => l.Contains("command RUNSQL: failed") && !l.Contains("already exists"));
+            Assert.Contains(lines, l => l.Contains("command CHGJOB: ran nothing, answered success"));
+        }
+    }
+
     [Fact]
     public async Task StartServerNamesTheServerJob()
     {

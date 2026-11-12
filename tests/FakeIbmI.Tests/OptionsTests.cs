@@ -31,6 +31,14 @@ public class OptionsTests
         Assert.Equal(new Options(2323, null, IPAddress.Loopback, CommandPort: 8475, CommandTlsPort: 9475),
             Options.Parse(["--command-port", "8475", "--command-tls-port", "9475"]));
 
+    [Fact]
+    public void TheDatabaseAndSourceFolderAreOptions()
+    {
+        Assert.Equal(new Options(2323, null, IPAddress.Loopback, Database: "fake.db", SourceDir: "src", Check: true),
+            Options.Parse(["--database", "fake.db", "--check", "--source-dir", "src"]));
+        Assert.Throws<ArgumentException>(() => Options.Parse(["--check"]));
+    }
+
     [Theory]
     [InlineData("--signon-tls-port")]
     [InlineData("--print-tls-port")]

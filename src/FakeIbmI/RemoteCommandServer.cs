@@ -4,15 +4,17 @@
 //   1001 exchange attributes -> 8001: return code, CCSID 37, NLV 2924, version, data stream level
 //   1002 run command         -> 8002: return code 0, no messages
 //   1003 call program        -> 8003: return code 0, each output parameter zero-filled
-// It runs nothing. Every command and program succeeds. A few programs get real answers (see
-// Answer): QWCRTVCA the job's name, QSYCKUFU "allowed". Any other program's output is zeros,
-// which an IBM API reads as an empty error code: success with nothing returned. It logs each
+// The machine's own commands (CALL of a program it has, CRTBNDRPG, RUNSQL and so on) and programs
+// created from source run for real. Anything else runs nothing and succeeds. A few IBM programs
+// get real answers (see Answer): QWCRTVCA the job's name, QSYCKUFU "allowed". Any other program's
+// output is zeros, which an IBM API reads as an empty error code: success with nothing returned. It logs each
 // command's name and each program's name and parameter sizes, but never a command's text or a
 // parameter's contents, which can hold passwords.
 
 using System.Buffers.Binary;
 using System.Net;
 using System.Text;
+using FakeIbmI.Rpg;
 
 namespace FakeIbmI;
 
@@ -38,27 +40,32 @@ public sealed class RemoteCommandServer : HostServer
     private int _signOns;
     private int _refusals;
 
-    private RemoteCommandServer(int port, Action<string>? log, IPAddress? address, Users? users, TlsOptions? tls)
+    private RemoteCommandServer(int port, Action<string>? log, IPAddress? address, Users? users, TlsOptions? tls, Machine? machine)
         : base(port, log, address, tls)
     {
         Users = users ?? Users.Defaults();
+        Machine = machine ?? Machine.Open();
     }
 
     /// <summary>
     /// Listens on the loopback interface, or on <paramref name="address"/>. Port 0 picks a free port
     /// (see <see cref="HostServer.Port"/>). Pass the other servers' <paramref name="users"/> to share
     /// them (the default is <see cref="Users.Defaults"/>). With <paramref name="tls"/>, it also listens for TLS.
+    /// The programs it can really call are in <paramref name="machine"/>; the default is one of its own, in memory.
     /// </summary>
     public static Task<RemoteCommandServer> StartAsync(int port = 0, Action<string>? log = null, IPAddress? address = null,
-        Users? users = null, TlsOptions? tls = null)
+        Users? users = null, TlsOptions? tls = null, Machine? machine = null)
     {
-        var server = new RemoteCommandServer(port, log, address, users, tls);
+        var server = new RemoteCommandServer(port, log, address, users, tls, machine);
         server.Start();
         return Task.FromResult(server);
     }
 
     /// <summary>The user profiles it signs on.</summary>
     public Users Users { get; }
+
+    /// <summary>The source members, programs and tables its commands and program calls work on.</summary>
+    public Machine Machine { get; }
 
     /// <summary>Successful sign-ons so far.</summary>
     public int SignOns => Volatile.Read(ref _signOns);
@@ -95,8 +102,8 @@ public sealed class RemoteCommandServer : HostServer
                 0x1001 => Frame(ServerId, 0x8001,
                     [0, 0, .. BigEndian(Ccsid), .. Ebcdic.Encode("2924"), .. BigEndian(1), DataStreamLevel >> 8, DataStreamLevel & 0xFF],
                     correlation),
-                0x1002 => RunCommand(request, id, correlation),
-                0x1003 => CallProgram(request, id, correlation),
+                0x1002 => await RunCommandAsync(request, id, correlation, profile.User),
+                0x1003 => await CallProgramAsync(request, id, correlation, profile.User),
                 // 0x0205: invalid request ID.
                 var other => Frame(ServerId, (ushort)(other | 0x8000), [0x02, 0x05, 0, 0], correlation),
             };
@@ -105,7 +112,7 @@ public sealed class RemoteCommandServer : HostServer
     }
 
     /// <summary>1002: the message option byte, then the command: 0x1104 (CCSID, then text) or 0x1101 (EBCDIC).</summary>
-    private byte[] RunCommand(byte[] request, int id, int correlation)
+    private async Task<byte[]> RunCommandAsync(byte[] request, int id, int correlation, string user)
     {
         var points = CodePoints(request);
         string command;
@@ -117,6 +124,20 @@ public sealed class RemoteCommandServer : HostServer
         else command = Ebcdic.Decode(points.GetValueOrDefault(0x1101) ?? []);
         var name = CommandName(command);
         Record($"CMD {name}");
+        // A CALL of a program the machine doesn't have is some IBM program: it succeeds unrun, like any command the machine doesn't know.
+        if (name != "(not a command name)" && (name != "CALL" || CallsMyProgram(command)))
+        {
+            var job = new BatchJob(user, Stopping);
+            var result = await OnProgramThread(() => Machine.Run(command, job));
+            if (result.Known)
+            {
+                // What went wrong is logged for a program or a compile, whose messages name lines, not data.
+                var why = !result.Ok && name is "CALL" or "CRTBNDRPG" or "CRTSQLRPGI" or "CRTDSPF" ? $": {result.Message}" : "";
+                Log($"rmtcmd #{id} command {name}: {(result.Ok ? "ran" : "failed")}{why}{(job.Messages.Count > 0 ? $" (DSPLY showed {job.Messages.Count} message{(job.Messages.Count == 1 ? "" : "s")})" : "")}");
+                // Return code 0x0400: the command failed. No messages go back with it.
+                return Frame(ServerId, 0x8002, [(byte)(result.Ok ? 0 : 0x04), 0, 0, 0], correlation);
+            }
+        }
         Log($"rmtcmd #{id} command {name}: ran nothing, answered success");
         // Template: return code (2 bytes), message count (2 bytes).
         return Frame(ServerId, 0x8002, [0, 0, 0, 0], correlation);
@@ -127,7 +148,7 @@ public sealed class RemoteCommandServer : HostServer
     /// parameter as 0x1103: max length (4), usage (2), data. The reply has the return code and
     /// message count, then each output and in-out parameter as 0x1103: length (4), usage (2), data.
     /// </summary>
-    private byte[] CallProgram(byte[] request, int id, int correlation)
+    private async Task<byte[]> CallProgramAsync(byte[] request, int id, int correlation, string user)
     {
         var program = Ebcdic.Decode(request.AsSpan(20, 10)).TrimEnd();
         var library = Ebcdic.Decode(request.AsSpan(30, 10)).TrimEnd();
@@ -157,6 +178,23 @@ public sealed class RemoteCommandServer : HostServer
         }
 
         var name = $"{library}/{program}";
+        var real = Machine.Qualified(name);
+        if (Machine.HasProgram(real.Library, real.Name))
+        {
+            Record($"PGM {name}");
+            var (failure, results) = await OnProgramThread(() => RunProgram(name, parameters, user));
+            Log($"rmtcmd #{id} call {name} ({parameters.Count} parameter{(parameters.Count == 1 ? "" : "s")}): {(failure is null ? "ran" : $"failed: {failure}")}");
+            // Return code 0x0500: the program failed. No messages go back with it.
+            if (failure is not null) return Frame(ServerId, 0x8003, [0x05, 0, 0, 0], correlation);
+            var returned = new List<(int Id, byte[] Data)>();
+            for (var i = 0; i < parameters.Count; i++)
+            {
+                var p = parameters[i];
+                if (p.Kind is not (ParameterKind.Output or ParameterKind.InOut) || p.MaxLength == 0) continue;
+                returned.Add((0x1103, OutputParameter(p.MaxLength, p.Kind == ParameterKind.Output ? (ushort)2 : (ushort)3, results[i])));
+            }
+            return Frame(ServerId, 0x8003, [0, 0, 0, 0], correlation, 0, [.. returned]);
+        }
         var (answers, answered) = Answer(name, parameters, id);
         var outputs = new List<(int Id, byte[] Data)>();
         for (var i = 0; i < parameters.Count; i++)
@@ -178,6 +216,70 @@ public sealed class RemoteCommandServer : HostServer
         }).ToList();
         Log($"rmtcmd #{id} call {name} ({(sizes.Count == 0 ? "no parameters" : string.Join(", ", sizes))}): ran nothing, {answered}");
         return Frame(ServerId, 0x8003, [0, 0, 0, 0], correlation, 0, [.. outputs]);
+    }
+
+    private bool CallsMyProgram(string command)
+    {
+        try
+        {
+            if (ClCommand.Parse(command).Value("PGM", 0) is not { } program) return false;
+            var (library, name) = Machine.Qualified(program);
+            return Machine.HasProgram(library, name);
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Calls a program the machine has, with each parameter's bytes read as the type the program
+    /// declares for it. Returns why it failed (or null), and each parameter's bytes afterwards.
+    /// </summary>
+    private (string? Failure, List<byte[]> Results) RunProgram(string name, List<Parameter> parameters, string user)
+    {
+        var job = new BatchJob(user, Stopping);
+        try
+        {
+            var (library, program) = Machine.Qualified(name);
+            var types = Machine.ParameterTypes(library, program, job)!;
+            if (parameters.Count > types.Count) return ($"{program} takes {types.Count} parameters, not {parameters.Count}", []);
+            var cells = new List<Cell>();
+            for (var i = 0; i < parameters.Count; i++)
+            {
+                var cell = new Cell(types[i]);
+                if (parameters[i].Kind is ParameterKind.Input or ParameterKind.InOut) ParameterBytes.Load(cell, parameters[i].Input);
+                cells.Add(cell);
+            }
+            Machine.Call(name, cells, job);
+            return (null, [.. cells.Select((cell, i) => ParameterBytes.Store(cell, parameters[i].MaxLength))]);
+        }
+        catch (Exception e) when (e is RpgHalt or RpgError)
+        {
+            return (e.Message, []);
+        }
+    }
+
+    /// <summary>Runs a program on a thread of its own, with room for deep recursion, so a long one holds up no other connection.</summary>
+    private static Task<T> OnProgramThread<T>(Func<T> run)
+    {
+        var done = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        new Thread(() =>
+        {
+            try
+            {
+                done.SetResult(run());
+            }
+            catch (Exception e)
+            {
+                done.SetException(e);
+            }
+        }, 16 * 1024 * 1024)
+        {
+            IsBackground = true,
+            Name = "program",
+        }.Start();
+        return done.Task;
     }
 
     private enum ParameterKind

@@ -20,11 +20,18 @@ public sealed class NetworkPrintServer : HostServer
     private int _signOns;
     private int _refusals;
 
-    private NetworkPrintServer(int port, Action<string>? log, IPAddress? address, Users? users, TlsOptions? tls)
+    private NetworkPrintServer(int port, Action<string>? log, IPAddress? address, Users? users, TlsOptions? tls, Machine? machine)
         : base(port, log, address, tls)
     {
         Users = users ?? Users.Defaults();
+        Machine = machine;
     }
+
+    /// <summary>The machine whose programs' printed output it lists after <see cref="Files"/>, or null.</summary>
+    public Machine? Machine { get; }
+
+    /// <summary>The placeholder files, then what programs have printed (each as an *SCS file).</summary>
+    private List<SpooledFile> AllFiles() => [.. Files, .. Machine?.Store.Spools().Select(SpooledFile.From) ?? []];
 
     /// <summary>
     /// Listens on the loopback interface, or on <paramref name="address"/> (the demo container
@@ -34,9 +41,9 @@ public sealed class NetworkPrintServer : HostServer
     /// <paramref name="tls"/>, it also listens for TLS.
     /// </summary>
     public static Task<NetworkPrintServer> StartAsync(int port = 0, Action<string>? log = null, IPAddress? address = null,
-        Users? users = null, TlsOptions? tls = null)
+        Users? users = null, TlsOptions? tls = null, Machine? machine = null)
     {
-        var server = new NetworkPrintServer(port, log, address, users, tls);
+        var server = new NetworkPrintServer(port, log, address, users, tls, machine);
         server.Start();
         return Task.FromResult(server);
     }
@@ -127,7 +134,7 @@ public sealed class NetworkPrintServer : HostServer
                     yield return Reply(0x0007);
                     yield break;
                 }
-                var files = Files.ToList();
+                var files = AllFiles();
                 if (files.Count == 0)
                 {
                     yield return Reply(0x0014);
@@ -149,7 +156,7 @@ public sealed class NetworkPrintServer : HostServer
             case (SpooledFileObject, 0x0002):
             {
                 var key = ReadAttributes(points.GetValueOrDefault(0x0001) ?? []);
-                var file = Files.FirstOrDefault(f => Equals(key.GetValueOrDefault(0x0068), f.Name)
+                var file = AllFiles().FirstOrDefault(f => Equals(key.GetValueOrDefault(0x0068), f.Name)
                                                      && Equals(key.GetValueOrDefault(0x003C), f.JobNumber)
                                                      && Equals(key.GetValueOrDefault(0x0069), f.Number));
                 if (file is null)
@@ -292,6 +299,23 @@ public sealed record SpooledFile(
         new("QPDFOUT", 3, "BATCHJOB", "123457", "*USERASCII", 1, "PDFDATA", "QPRINT", "1261012", "100000",
             "%PDF-1.4\n% placeholder spooled PDF\n%%EOF\n"u8.ToArray()),
     ];
+
+    /// <summary>What a program printed, as an *SCS file: lines of EBCDIC, 60 to a page, a form feed ending each.</summary>
+    public static SpooledFile From(SpoolRecord r)
+    {
+        List<byte> scs = [0x2B, 0xC1, 0x02, (byte)Math.Min(r.Width, 255), 0x2B, 0xC2, 0x02, 66];
+        var lines = r.Text.Length == 0 ? [] : r.Text.Split('\n');
+        for (var i = 0; i < lines.Length; i++)
+        {
+            if (i > 0 && i % 60 == 0) scs.Add(0x0C);
+            scs.AddRange(Ebcdic.Encode(lines[i]));
+            scs.Add(0x15);
+        }
+        scs.Add(0x0C);
+        var c = r.Created;
+        return new SpooledFile(r.Name, (int)r.Id, "FAKEIBMI", ((int)(r.Id % 900000) + 100000).ToString(), "*SCS", r.Pages, "", "QPRINT",
+            $"{(c.Year - 1900) / 100}{c.Year % 100:00}{c.Month:00}{c.Day:00}", c.ToString("HHmmss"), [.. scs]);
+    }
 
     /// <summary>SCS: forms 132 by 66, a heading and lines on page one, a form feed, one line on page two.</summary>
     public static byte[] WideReport()

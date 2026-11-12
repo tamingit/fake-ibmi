@@ -7,6 +7,8 @@
 # TLS on IBM's ports too: Telnet 992, Network Print 9474, remote command 9475, sign-on 9476. The certificate is made
 # in /certs on first start; mount a named volume there (-v fake-ibmi-certs:/certs) to keep it,
 # and copy /certs/fake-ibmi.crt out for clients to trust.
+# The SQLite database (source, programs, tables, spooled files) is /data/fake-ibmi.db: mount a named
+# volume on /data (-v fake-ibmi-data:/data) to keep it. Add --source-dir with a mounted folder to load source.
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
@@ -18,8 +20,8 @@ RUN dotnet publish src/FakeIbmI/FakeIbmI.csproj -c Release --no-restore -o /app
 FROM mcr.microsoft.com/dotnet/runtime:10.0
 WORKDIR /app
 COPY --from=build /app ./
-RUN mkdir /certs && chown app /certs
+RUN mkdir /certs /data && chown app /certs /data
 USER app
 EXPOSE 2323 992 8474 9474 8475 9475 8476 9476 449
 ENTRYPOINT ["dotnet", "FakeIbmI.dll", "--bind", "0.0.0.0", "--port", "2323", "--print-port", "8474", "--signon-port", "8476", "--command-port", "8475", "--mapper-port", "449", \
-    "--tls-port", "992", "--print-tls-port", "9474", "--signon-tls-port", "9476", "--command-tls-port", "9475", "--tls-cert", "/certs/fake-ibmi.pfx"]
+    "--tls-port", "992", "--print-tls-port", "9474", "--signon-tls-port", "9476", "--command-tls-port", "9475", "--tls-cert", "/certs/fake-ibmi.pfx", "--database", "/data/fake-ibmi.db"]

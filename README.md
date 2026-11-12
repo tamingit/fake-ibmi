@@ -1,6 +1,6 @@
 # Fake IBM i
 
-A scripted stand-in for an IBM i, for testing 5250 clients without a real system. It speaks TN5250E over Telnet, and four of IBM's host servers: the port mapper, sign-on, remote command and Network Print. All but the port mapper can also listen for TLS. Its screens are placeholders, and it keeps nothing.
+A scripted stand-in for an IBM i, for testing 5250 clients without a real system. It speaks TN5250E over Telnet, and four of IBM's host servers: the port mapper, sign-on, remote command and Network Print. All but the port mapper can also listen for TLS. Its screens are placeholders, except the ones for [RPG, SQL and source](#rpg). It keeps nothing, unless you give it a [database file](#rpg).
 
 It was split out of [GreenGlow Connect](https://github.com/tamingit/greenglow), where it ran the server's and browser's tests and the public demo.
 
@@ -17,7 +17,9 @@ It was split out of [GreenGlow Connect](https://github.com/tamingit/greenglow), 
   - **Change Password:** the expired user goes on to this screen, which needs the current password and the new one twice. F3 or F12 goes back to sign-on.
   - **Main menu:**
     - `4`: a list of placeholder items, three pages long, paged with Page Up and Page Down.
+    - `5`: [source members](#rpg): list, edit, check and compile them.
     - `132`: a 27 × 132 screen.
+    - **Command line:** `CALL`, `CRTBNDRPG`, `CRTSQLRPGI`, `CRTDSPF`, `RUNSQLSTM`, `RUNSQL`, `DLTPGM`, `DLTF`, `WRKMBRPDM` and `STRSEU`. Any other command says it isn't found.
     - `90` or `signoff`: ends the session.
     - F3: back to the sign-on screen.
 - **Logs:** it logs what clients do, but never the contents of a password field.
@@ -31,13 +33,38 @@ Password levels 0 and 1 use DES; 2 and 3 use SHA-1. The fake runs at level 2.
   - **Sign-on:** checks the user and password, and answers with the sign-on dates and the server's CCSID (37). It claims to be IBM i 7.5.
   - **Change password:** checks the old password, and the new one: it can't be empty, too long, or the same as the old one.
   - **Not supported:** profile tokens, Kerberos and multi-factor authentication.
-- **Remote command (port 8475):** runs CL commands and calls programs, as ACS does after signing on. It runs nothing: every command succeeds with no messages, and every program call succeeds. A few programs get real answers:
+- **Remote command (port 8475):** runs CL commands and calls programs, as ACS does after signing on. The [RPG commands](#rpg) (`CALL` of a program made from source, `CRTBNDRPG`, `RUNSQL` and so on) really run, and a program made from source is called with its parameters as bytes laid out as on an IBM i. A failed one answers return code `0400` (command) or `0500` (program) with no messages; the log says why. Anything else runs nothing: every other command succeeds with no messages, and so does every other program call. A few programs get real answers:
   - `QSYCKUFU` (Check User Function Usage): every function is allowed for every user (the API's `2`; `1` means not allowed). ACS checks its functions this way, such as `QIBM_XE1_5250` for the 5250 emulator.
   - `QWCRTVCA` (Retrieve Current Attributes): the server job's name.
   - **Any other program:** its output parameters come back filled with zeros. For an IBM API, zeros in the error code parameter mean success.
 
   The log names each command and program, with the program's parameter sizes and, for `QSYCKUFU`, the function checked. It never logs a command's parameters or other programs' data, which can hold passwords.
-- **Network Print (port 8474):** it lists placeholder spooled files and sends their contents.
+- **Network Print (port 8474):** it lists placeholder spooled files and sends their contents. After those come the spooled files RPG programs printed, as *SCS files (see [RPG](#rpg)).
+
+<a id="rpg"></a>**RPG, SQL and source**
+
+The fake runs free-form RPG IV against a SQLite database. Source members, the programs and display files made from them, spooled files and the tables SQL works on are all in that database: in memory by default, or in the file `--database` names.
+
+- **Getting source in:**
+  - **Folder:** `--source-dir` reads `.rpgle`, `.sqlrpgle`, `.dspf` and `.sql` files at start-up. A file is a member named for it, in the source file named for its folder (`QRPGLESRC`, `QDDSSRC` or `QSQLSRC` when it's directly in the folder). Members that are new or changed are saved, checked and created: SQL first, then display files, then programs. Run again, nothing changes unless a file did.
+  - **5250:** option 5 on the main menu, or `WRKMBRPDM`, lists members: 2 edits, 4 deletes, 5 shows the diagnostics, 14 compiles; F6 makes a new one. `STRSEU SRCFILE(QRPGLESRC) SRCMBR(NAME)` opens the editor directly. Source lines are 72 columns; line commands are `I` (insert after) and `D` (delete). F3 saves, F12 cancels.
+- **Checking:** saving a member records what the fake can't run, by line, and what it translated or ignored. A program is still created with lines it can't run; reaching one ends the program with a message naming the line. `--source-dir DIR --check` does only the checking, prints the findings and exits with code 3 when something isn't supported.
+- **Running:** `CALL PGM(NAME) PARM(...)` on the 5250 command line (the program's screens and `DSPLY` messages appear in the session) or through the remote command server. A program starts fresh on every call, as if it always ended with `*INLR` on.
+
+*RPG supported:* free-form only (`**FREE`, or code in columns 8 to 80 with `dcl-` statements); `dcl-s`, `dcl-ds` (including `likeds`, `extname` and `qualified`), `dcl-c`, `dcl-pr` with `extpgm` to call another program, `dcl-proc` and `dcl-pi`, subroutines, `if`, `dow`, `dou`, `for`, `for-each`, `select`, `monitor`, `dsply` (with a reply), about 55 built-in functions, arrays, dates, times and timestamps, and edit codes. *Not supported, and reported when saving:* fixed-form specifications, `/COPY`, native file I/O (`chain` on a disk file and so on: use SQL), data areas, pointers, `sorta`, `goto` and commitment control.
+
+*SQL:* `exec sql` runs on SQLite. Db2 for i syntax is translated where it's simple: library qualifiers (`LIB/TABLE` and `LIB.TABLE`) are dropped, so every table is in one place; `FETCH FIRST n ROWS ONLY`, `OFFSET`, `CONCAT`, `CURRENT DATE` and the other special registers, `WITH UR` and the other isolation clauses, `FOR READ ONLY`, `RRN()`, host variables and indicators, `GET DIAGNOSTICS ... ROW_COUNT`, `CREATE OR REPLACE TABLE`, identity columns and `WITH DEFAULT`. Db2 scalar functions SQLite lacks (`UCASE`, `DIGITS`, `YEAR`, `POSSTR` and so on) are added to it. `SQLCODE` and `SQLSTATE` are set as Db2 sets them for the common cases. Cursors fetch forward only. *Not supported, and reported when saving:* the system catalog and services (`QSYS2.`), `CALL`, `MERGE`, `WHERE CURRENT OF`, multiple-row `FETCH`, date arithmetic with durations, and stored procedures. There is no commitment control: `COMMIT` and `SET OPTION` are ignored with a note.
+
+*Display files (DDS):* record formats with named fields and constants, input and output fields, option indicators, `CAnn` and `CFnn` keys with response indicators, `DSPATR`, `COLOR`, `ERRMSG`, `EDTCDE`, `OVERLAY`, and single-line subfiles (`SFL`, `SFLCTL`, `SFLDSP`, `SFLCLR`, `SFLEND`, `SFLPAG`), which page by themselves. `EXFMT`, `WRITE`, `READ`, `READC`, `CHAIN` and `UPDATE` work on them. 24 × 80 only; windows, help and multi-line subfile records aren't supported.
+
+*Printing:* `dcl-f name printer(width);` and `write name line;` collect lines, and when the program ends they become one spooled file named for the printer file, which the Network Print server lists and serves.
+
+The examples are in `examples/`: `source` (a hello program and a customer list) and `customers`, a customer maintenance program with a 50-customer table, a list with search, lookup, create and print.
+
+```bash
+dotnet run --project src/FakeIbmI -- --source-dir examples/customers --print-port 8474
+# then sign on at port 2323 and enter: CALL CUSTMNT
+```
 
 <a id="users"></a>**Users**
 
@@ -67,13 +94,14 @@ As on an IBM i, TLS is a second port for the same server: Telnet on 992, sign-on
 Docker:
 
 ```bash
-docker run --rm --env-file .env -v fake-ibmi-certs:/certs \
+docker run --rm --env-file .env -v fake-ibmi-certs:/certs -v fake-ibmi-data:/data \
   -p 127.0.0.1:2323:2323 -p 127.0.0.1:992:992 -p 127.0.0.1:8474:8474 -p 127.0.0.1:9474:9474 \
   -p 127.0.0.1:8475:8475 -p 127.0.0.1:9475:9475 -p 127.0.0.1:8476:8476 -p 127.0.0.1:9476:9476 \
   -p 127.0.0.1:449:449 ghcr.io/tamingit/fake-ibmi
 ```
 
 - **Ports:** publish each port on the same number: the port mapper tells clients the ports inside the container.
+- **Database:** the image keeps its SQLite database in `/data` (source, programs, tables and spooled files), so a named volume keeps them from one run to the next. To load source, mount a folder and pass `--source-dir`: `-v "$PWD/examples/customers:/source:ro" ... ghcr.io/tamingit/fake-ibmi --source-dir /source`.
 - **Certificate:** the image keeps its certificate in `/certs`. The named volume keeps it from one run to the next, so clients only need to trust it once. Copy out the part to trust with `docker cp <container>:/certs/fake-ibmi.crt .`. Use a named volume rather than a directory: the fake runs as a non-root user, which can't write to a directory you mount.
 
 With the .NET 10 SDK:
@@ -93,6 +121,9 @@ Port 449 is below 1024, so outside a container the fake needs root, or `CAP_NET_
   - `--tls-port`, `--signon-tls-port`, `--command-tls-port`, `--print-tls-port`: TLS ports for Telnet, sign-on, remote command and Network Print (default: none). Each but the first needs its server's plain port too.
   - `--tls-cert`: the certificate for the TLS ports (default: one made for this run only).
   - `--tls-name`: another name or address for a certificate the fake makes. Repeat it, or separate names with commas.
+  - `--database`: the SQLite file for source, programs, display files, spooled files and tables (default: in memory, gone when the fake stops).
+  - `--source-dir`: a folder of source to read at start-up (see [RPG](#rpg)).
+  - `--check`: with `--source-dir`, only check the source, report what isn't supported and exit (code 3 when something isn't).
   - `--env-file`: the file of settings, such as the [users](#users) (default: `.env`, when there is one).
   - `--bind`: the address to listen on (default `127.0.0.1`).
   - `--trace`: logs each Telnet negotiation step, and each record's length. It never logs a record's contents, or the value of a NEW-ENVIRON variable that can hold a secret (`IBMSUBSPW`, `IBMRSEED`).

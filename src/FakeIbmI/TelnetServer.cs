@@ -6,6 +6,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
+using static FakeIbmI.Stream5250;
 
 namespace FakeIbmI;
 
@@ -21,13 +22,6 @@ public sealed record ReceivedInput(int Aid, int CursorRow, int CursorColumn, IRe
 
 public sealed class TelnetServer : IAsyncDisposable
 {
-    private const byte Esc = 0x04;
-    private const int EnterAid = 0xf1;
-    private const int F3Aid = 0x33;
-    private const int F12Aid = 0x3c;
-    private const int RollDownAid = 0xf4;
-    private const int RollUpAid = 0xf5;
-
     private enum Screen
     {
         SignOn,
@@ -44,12 +38,19 @@ public sealed class TelnetServer : IAsyncDisposable
         List1,
         List2,
         List3,
+
+        /// <summary>A source screen: the member list, the editor or a member's diagnostics (see Panels.cs).</summary>
+        Panel,
+
+        /// <summary>A program is running: its screens are the display file's, or DSPLY's messages.</summary>
+        Program,
     }
 
     private readonly TcpListener _listener;
     private readonly TcpListener? _tlsListener;
     private readonly TlsOptions? _tls;
     private readonly Users _users;
+    private readonly Machine _machine;
     private readonly Action<string>? _log;
     private readonly bool _trace;
     private readonly object _gate = new();
@@ -63,9 +64,10 @@ public sealed class TelnetServer : IAsyncDisposable
     private int _open;
     private int _nextId;
 
-    private TelnetServer(TcpListener listener, TcpListener? tlsListener, TlsOptions? tls, Users users, Action<string>? log, bool trace)
+    private TelnetServer(TcpListener listener, TcpListener? tlsListener, TlsOptions? tls, Users users, Action<string>? log, bool trace, Machine machine)
     {
         _users = users;
+        _machine = machine;
         _listener = listener;
         _tlsListener = tlsListener;
         _tls = tls;
@@ -80,11 +82,12 @@ public sealed class TelnetServer : IAsyncDisposable
     /// (never its contents, which may hold a password). With <paramref name="tls"/>, it also
     /// listens for Telnet over TLS (an IBM i uses port 992), with the same sessions and devices.
     /// The sign-on screen checks <paramref name="users"/>; pass the host servers' to share them
-    /// (the default is <see cref="Users.Defaults"/>).
+    /// (the default is <see cref="Users.Defaults"/>). Source members, programs and tables are in
+    /// <paramref name="machine"/>; the default is one of its own, in memory.
     /// </summary>
     public static Task<TelnetServer> StartAsync(
         int port = 0, Action<string>? log = null, IPAddress? address = null, bool trace = false, TlsOptions? tls = null,
-        Users? users = null)
+        Users? users = null, Machine? machine = null)
     {
         var listener = new TcpListener(address ?? IPAddress.Loopback, port);
         var tlsListener = tls is null ? null : new TcpListener(address ?? IPAddress.Loopback, tls.Port);
@@ -98,7 +101,7 @@ public sealed class TelnetServer : IAsyncDisposable
             listener.Stop();
             throw;
         }
-        var host = new TelnetServer(listener, tlsListener, tls, users ?? Users.Defaults(), log, trace);
+        var host = new TelnetServer(listener, tlsListener, tls, users ?? Users.Defaults(), log, trace, machine ?? Machine.Open());
         host._acceptLoops = tlsListener is null
             ? [host.AcceptLoopAsync(listener, tls: false)]
             : [host.AcceptLoopAsync(listener, tls: false), host.AcceptLoopAsync(tlsListener, tls: true)];
@@ -112,6 +115,9 @@ public sealed class TelnetServer : IAsyncDisposable
 
     /// <summary>The user profiles the sign-on screen checks.</summary>
     public Users Users => _users;
+
+    /// <summary>The source members, programs and tables its sessions work on.</summary>
+    public Machine Machine => _machine;
 
     /// <summary>Connections accepted so far.</summary>
     public int Connections => Volatile.Read(ref _connections);
@@ -293,7 +299,29 @@ public sealed class TelnetServer : IAsyncDisposable
             await SendAsync(Telnet.EncodeSubnegotiation(TelnetOption.TerminalType, [1]), "SB TERMINAL-TYPE SEND");
         }
 
+        // Shows what a running program sends until it waits for the user (true) or has ended (false).
+        async Task<bool> PumpAsync()
+        {
+            while (session.Job is { } job)
+            {
+                var next = await job.NextAsync(_stop.Token);
+                if (next.Screen is null)
+                {
+                    session.Job = null;
+                    Log($"#{id} program ended{(next.Message is null ? "" : " in error")}");
+                    screen = session.Panel is null ? Screen.Main : Screen.Panel;
+                    await SendAsync(Show(screen, next.Message, session), $"screen {screen}");
+                    return false;
+                }
+                await SendAsync(next.Screen, "program screen");
+                if (next.Wait) return true;
+            }
+            return false;
+        }
+
         await AskAsync(TelnetOption.NewEnviron);
+        try
+        {
         while (true)
         {
             var count = await stream.ReadAsync(buffer, _stop.Token);
@@ -382,11 +410,20 @@ public sealed class TelnetServer : IAsyncDisposable
                         await AskAsync(TelnetOption.Binary);
                         await OfferAsync(TelnetOption.Binary);
                         break;
+                    case TelnetEvent.Record r when started && session.Job is { } running:
+                        // The program is waiting on this screen: the input is its own.
+                        if (ReadInput(r.Data, null) is { } reply)
+                        {
+                            running.Reply(reply.Input);
+                            await PumpAsync();
+                        }
+                        break;
                     case TelnetEvent.Record r when started:
                         var (next, message) = HandleRecord(r.Data, screen, session);
                         if (next is null) return device;
                         screen = next.Value;
-                        await SendAsync(Show(screen, message), $"screen {screen}");
+                        if (session.Job is not null) await PumpAsync();
+                        else await SendAsync(Show(screen, message, session), $"screen {screen}");
                         break;
                 }
                 if (started || !terminalType || !environment) continue;
@@ -418,8 +455,14 @@ public sealed class TelnetServer : IAsyncDisposable
                 }
                 Log($"#{id} session started on {device}");
                 await SendAsync(StartupRecord("I902", device!), "startup response I902");
-                await SendAsync(Show(Screen.SignOn, null), $"screen {Screen.SignOn}");
+                await SendAsync(Show(Screen.SignOn, null, session), $"screen {Screen.SignOn}");
             }
+        }
+        }
+        finally
+        {
+            // A program still running ends with its session.
+            session.Job?.Cancel();
         }
     }
 
@@ -518,22 +561,28 @@ public sealed class TelnetServer : IAsyncDisposable
     private sealed class SignOnSession
     {
         public UserProfile? Changing { get; set; }
+
+        /// <summary>Who signed on.</summary>
+        public string User { get; set; } = "";
+
+        /// <summary>The source screen shown, when one is.</summary>
+        public Panel? Panel { get; set; }
+
+        /// <summary>The program running, when one is.</summary>
+        public InteractiveJob? Job { get; set; }
     }
 
     /// <summary>
-    /// Applies one client record. Returns the screen to show next (null to close the
-    /// connection) and an error-row message for it. A record that is not a read reply changes nothing.
+    /// A read reply as input: cursor row, cursor column, AID, then SBA row column data for each
+    /// field. Null for any other record (one with no cursor, such as a query reply). The contents
+    /// of a field <paramref name="secret"/> picks are returned apart, and recorded as asterisks.
     /// </summary>
-    private (Screen? Next, string? Message) HandleRecord(byte[] bytes, Screen screen, SignOnSession session)
+    private (ReceivedInput Input, Dictionary<(int Row, int Column), string> Secrets)? ReadInput(byte[] bytes, Func<int, int, bool>? secret)
     {
-        if (Records.Parse(bytes) is not ParsedRecord.Data { Record: var record }) return (screen, null);
-        // A read reply: cursor row, cursor column, AID, then SBA row column data for each field.
-        // Anything with no cursor (such as a query reply) is not input.
+        if (Records.Parse(bytes) is not ParsedRecord.Data { Record: var record }) return null;
         var data = record.Data;
-        if (record.Opcode is not (Opcode.NoOperation or Opcode.PutGet) || data.Length < 3 || data[0] == 0) return (screen, null);
-        var aid = data[2];
+        if (record.Opcode is not (Opcode.NoOperation or Opcode.PutGet) || data.Length < 3 || data[0] == 0) return null;
         var fields = new List<ReceivedField>();
-        // Password fields' contents, kept here only: what's recorded has asterisks instead.
         var secrets = new Dictionary<(int Row, int Column), string>();
         var i = 3;
         while (i < data.Length)
@@ -545,14 +594,30 @@ public sealed class TelnetServer : IAsyncDisposable
             var start = i;
             while (i < data.Length && data[i] != 0x11) i++;
             var text = Ebcdic.Decode(data.AsSpan(start, i - start)).Replace('\0', ' ').TrimEnd();
-            var secret = column == FieldColumn
-                         && (screen == Screen.SignOn && row == PasswordRow
-                             || screen == Screen.ChangePassword && row is CurrentPasswordRow or NewPasswordRow or VerifyPasswordRow);
-            if (secret) secrets[(row, column)] = text;
-            fields.Add(new ReceivedField(row, column, secret ? new string('*', text.Length) : text));
+            var hidden = secret?.Invoke(row, column) ?? false;
+            if (hidden) secrets[(row, column)] = text;
+            fields.Add(new ReceivedField(row, column, hidden ? new string('*', text.Length) : text));
         }
-        var input = new ReceivedInput(aid, data[0], data[1], fields);
+        var input = new ReceivedInput(data[2], data[0], data[1], fields);
         lock (_gate) _inputs.Add(input);
+        return (input, secrets);
+    }
+
+    /// <summary>
+    /// Applies one client record. Returns the screen to show next (null to close the
+    /// connection) and an error-row message for it. A record that is not a read reply changes nothing.
+    /// </summary>
+    private (Screen? Next, string? Message) HandleRecord(byte[] bytes, Screen screen, SignOnSession session)
+    {
+        // Password fields' contents are kept here only: what's recorded has asterisks instead.
+        if (ReadInput(bytes, (row, column) => column == FieldColumn
+                && (screen == Screen.SignOn && row == PasswordRow
+                    || screen == Screen.ChangePassword && row is CurrentPasswordRow or NewPasswordRow or VerifyPasswordRow))
+            is not var (input, secrets))
+        {
+            return (screen, null);
+        }
+        var aid = input.Aid;
 
         string Secret(int row) => secrets.GetValueOrDefault((row, FieldColumn), "");
 
@@ -571,6 +636,7 @@ public sealed class TelnetServer : IAsyncDisposable
             {
                 case SignOnResult.SignedOn:
                     Log($"sign-on by {user}");
+                    session.User = user;
                     return (Screen.Main, null);
                 case SignOnResult.UnknownUser:
                     Log($"sign-on rejected: no user {user}");
@@ -608,6 +674,7 @@ public sealed class TelnetServer : IAsyncDisposable
             }
             changing.ChangePassword(newPassword);
             Log($"password changed for {changing.User}; sign-on by {changing.User}");
+            session.User = changing.User;
             session.Changing = null;
             return (Screen.Main, "Password changed successfully.");
         }
@@ -627,6 +694,13 @@ public sealed class TelnetServer : IAsyncDisposable
                 return page == 0 ? (screen, "Already at the first page (placeholder)") : (screen - 1, null);
             Log("list: back to the menu");
             return (Screen.Main, null);
+        }
+
+        if (screen == Screen.Panel && session.Panel is { } panel)
+        {
+            var result = panel.Handle(input);
+            session.Panel = result.Next;
+            return (result.Next is null ? Screen.Main : Screen.Panel, result.Message);
         }
 
         if (aid == F3Aid)
@@ -652,17 +726,81 @@ public sealed class TelnetServer : IAsyncDisposable
                 Log("main menu: wide screen");
                 return (Screen.Wide, null);
             }
-            if (text.Length > 0)
+            if (text == "5")
+            {
+                Log("main menu: members");
+                session.Panel = new MemberListPanel(_machine, Log);
+                return (Screen.Panel, null);
+            }
+            if (text.Length > 0 && text.All(char.IsAsciiDigit))
             {
                 Log("main menu: invalid option");
                 return (Screen.Main, $"Option {text} is not valid (placeholder)");
             }
+            if (text.Length > 0) return Command(text, session);
         }
         return (Screen.Main, null);
     }
 
-    private byte[] Show(Screen screen, string? message) => screen switch
+    /// <summary>
+    /// A command typed on the main menu's command line. WRKMBRPDM and STRSEU open the source
+    /// screens; CALL runs its program as this session's job; the machine runs the rest. Only the
+    /// command's name is logged: its parameters can hold anything.
+    /// </summary>
+    private (Screen? Next, string? Message) Command(string text, SignOnSession session)
     {
+        ClCommand command;
+        try
+        {
+            command = ClCommand.Parse(text);
+        }
+        catch (FormatException e)
+        {
+            return (Screen.Main, e.Message);
+        }
+        Log($"command {command.Name} by {session.User}");
+        switch (command.Name)
+        {
+            case "WRKMBRPDM":
+                session.Panel = new MemberListPanel(_machine, Log);
+                return (Screen.Panel, null);
+            case "STRSEU":
+            {
+                if (command.Value("SRCMBR", 1)?.ToUpperInvariant() is not { } name) return (Screen.Main, "Parameter SRCMBR required.");
+                var (library, file) = command.Value("SRCFILE", 0) is { } f ? Machine.Qualified(f) : (null, null);
+                var list = new MemberListPanel(_machine, Log);
+                var member = _machine.Store.FindMember(library, file, name);
+                if (member is null)
+                {
+                    // A new member, of the type given (RPGLE without one).
+                    var type = command.Value("TYPE", 2)?.ToUpperInvariant() ?? "RPGLE";
+                    if (!Machine.IsName(name) || Machine.TypeForExtension(type) is null || file is not null && !Machine.IsName(file))
+                        return (Screen.Main, $"Member {name} can't be created: check its name, file and type (RPGLE, SQLRPGLE, DSPF, SQL).");
+                    member = new Member(library ?? _machine.CurrentLibrary, file ?? Machine.DefaultFile(type), name, type, type is "RPGLE" or "SQLRPGLE" ? "**FREE" : "");
+                }
+                session.Panel = new EditorPanel(_machine, member, list, Log);
+                return (Screen.Panel, null);
+            }
+            case "CALL":
+                // On its own thread: the program's screens and DSPLY's messages come through this session.
+                session.Panel = null;
+                session.Job = InteractiveJob.Start(session.User, job =>
+                {
+                    var result = _machine.Run(text, job);
+                    return result.Ok ? null : result.Message;
+                }, _stop.Token);
+                return (Screen.Program, null);
+            default:
+            {
+                var result = _machine.Run(text, new BatchJob(session.User, _stop.Token));
+                return (Screen.Main, result.Message.Length == 0 ? null : result.Message);
+            }
+        }
+    }
+
+    private byte[] Show(Screen screen, string? message, SignOnSession session) => screen switch
+    {
+        Screen.Panel when session.Panel is { } panel => panel.Render(message),
         Screen.SignOn => SignOnScreen(message, PasswordField),
         Screen.ChangePassword => ChangePasswordScreen(message, PasswordField),
         Screen.Wide => WideScreen(),
@@ -687,36 +825,6 @@ public sealed class TelnetServer : IAsyncDisposable
         _users.PasswordLevel >= 2 ? Sf(0x4000, 0x27, 80 - FieldColumn) : Sf(0x4020, 0x27, 10);
     private const int SelectionRow = 20;
     private const int SelectionColumn = 7;
-
-    private static byte[] Text(string s) => Ebcdic.Encode(s);
-
-    private static byte[] Join(params byte[][] parts) => parts.SelectMany(p => p).ToArray();
-
-    private static byte[] Sba(int row, int column) => [0x11, (byte)row, (byte)column];
-
-    /// <summary>SF with a field format word, attribute and length.</summary>
-    private static byte[] Sf(int ffw, int attribute, int length) =>
-        [0x1d, (byte)(ffw >> 8), (byte)(ffw & 0xff), (byte)attribute, (byte)(length >> 8), (byte)(length & 0xff)];
-
-    private static byte[] Header(int errorRow) => [0x01, 0x07, 0x00, 0x00, 0x00, (byte)errorRow, 0x00, 0x00, 0x00];
-
-    /// <summary>CLEAR UNIT, then WTD (unlock keyboard, 0x00 0x18) with orders, then READ MDT FIELDS.</summary>
-    private static byte[] Screen5250(params byte[][] orders) => Screen5250Clear([Esc, 0x40], orders);
-
-    /// <summary>The same after CLEAR UNIT ALTERNATE 0x00: a 27 x 132 screen.</summary>
-    private static byte[] Screen5250Wide(params byte[][] orders) => Screen5250Clear([Esc, 0x20, 0x00], orders);
-
-    private static byte[] Screen5250Clear(byte[] clear, byte[][] orders) =>
-        HostRecord(
-            0x03,
-            Join(
-                clear,
-                [Esc, 0x11, 0x00, 0x18],
-                Join(orders),
-                [Esc, 0x52, 0x00, 0x00]));
-
-    private static byte[] Message(string? message) =>
-        message is null ? [] : Join(Sba(24, 2), [0x22], Text(message));
 
     private static byte[] SignOnScreen(string? message, byte[] passwordField) =>
         Screen5250(
@@ -779,6 +887,8 @@ public sealed class TelnetServer : IAsyncDisposable
             Text("3. Placeholder option three"),
             Sba(9, 5),
             Text("4. Placeholder list (3 pages)"),
+            Sba(12, 5),
+            Text("5. Work with source members"),
             Sba(10, 4),
             Text("90. Sign off"),
             Sba(11, 3),
@@ -861,13 +971,6 @@ public sealed class TelnetServer : IAsyncDisposable
             Text("F3=Exit   F12=Cancel"));
 
     // ---- Telnet and 5250 framing ----
-
-    private static byte[] HostRecord(int opcode, byte[] data)
-    {
-        var length = 10 + data.Length;
-        byte[] header = [(byte)(length >> 8), (byte)(length & 0xff), 0x12, 0xa0, 0, 0, 4, 0, 0, (byte)opcode];
-        return Telnet.EncodeRecord([.. header, .. data]);
-    }
 
     private static byte[] StartupRecord(string code, string deviceName)
     {

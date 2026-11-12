@@ -1,0 +1,37 @@
+     A* Work with Customers: a subfile of customers, and one customer to change.
+     A                                      DSPSIZ(24 80 *DS3)
+     A                                      CA03(03 'Exit')
+     A          R ROW                       SFL
+     A            OPT            1A  B  7  3
+     A            ID             5Y 0O  7  7EDTCDE(Z)
+     A            NAME          20A  O  7 14
+     A            BALANCE        9Y 2O  7 36EDTCDE(J)
+     A          R LIST                      SFLCTL(ROW)
+     A                                      SFLSIZ(100) SFLPAG(10)
+     A                                      OVERLAY
+     A  40                                  SFLDSP
+     A                                      SFLDSPCTL
+     A N40                                  SFLCLR
+     A  40                                  SFLEND(*MORE)
+     A                                  1 31'Work with Customers'
+     A                                      DSPATR(HI)
+     A                                  3  2'Type options, press Enter.'
+     A                                  4  4'5=Display'
+     A                                  6  2'Opt  Id     Name'
+     A                                      DSPATR(HI)
+     A                                  6 41'Balance'
+     A                                      DSPATR(HI)
+     A          R KEYS
+     A                                 23  2'F3=Exit'
+     A          R DETAIL
+     A                                      CA12(12 'Cancel')
+     A                                  1 36'Customer'
+     A                                      DSPATR(HI)
+     A                                  4  2'Id . . . . .'
+     A            ID             5Y 0O  4 16EDTCDE(Z)
+     A                                  5  2'Name . . . .'
+     A            NAME          20A  B  5 16CHECK(LC)
+     A  50                                  ERRMSG('Name required' 50)
+     A                                  6  2'Balance  . .'
+     A            BALANCE        9Y 2O  6 16EDTCDE(J)
+     A                                 23  2'Enter=Save   F12=Cancel'
